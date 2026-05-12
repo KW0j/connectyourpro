@@ -18,6 +18,7 @@
 #include <map>
 #include <conio.h>  // For _kbhit()
 #include "JoyConDecoder.h"
+#include "DsuServer.h"
 #include <Windows.h>
 
 #include <ViGEm/Client.h>
@@ -719,6 +720,22 @@ struct ConnectedJoyCon {
     GattCharacteristic writeChar = nullptr;
 };
 
+const wchar_t* GattStatusToString(GattCommunicationStatus status)
+{
+    switch (status) {
+        case GattCommunicationStatus::Success:
+            return L"Success";
+        case GattCommunicationStatus::Unreachable:
+            return L"Unreachable";
+        case GattCommunicationStatus::ProtocolError:
+            return L"ProtocolError";
+        case GattCommunicationStatus::AccessDenied:
+            return L"AccessDenied";
+        default:
+            return L"Unknown";
+    }
+}
+
 ConnectedJoyCon WaitForJoyCon(const std::wstring& prompt)
 {
     std::wcout << prompt << L"\n";
@@ -777,10 +794,20 @@ ConnectedJoyCon WaitForJoyCon(const std::wstring& prompt)
 
     cj.device = device;
 
-    auto servicesResult = device.GetGattServicesAsync().get();
-    if (servicesResult.Status() != GattCommunicationStatus::Success)
-    {
-        std::wcerr << L"Failed to get GATT services.\n";
+    GattDeviceServicesResult servicesResult = nullptr;
+    for (int attempt = 1; attempt <= 10; ++attempt) {
+        servicesResult = device.GetGattServicesAsync(BluetoothCacheMode::Uncached).get();
+        if (servicesResult.Status() == GattCommunicationStatus::Success) {
+            break;
+        }
+
+        std::wcerr << L"Failed to get GATT services (attempt " << attempt
+            << L"/10, status=" << GattStatusToString(servicesResult.Status()) << L"). Retrying...\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    if (!servicesResult || servicesResult.Status() != GattCommunicationStatus::Success) {
+        std::wcerr << L"Failed to get GATT services. Remove the Joy-Con from Windows Bluetooth settings, turn it off, then pair it again.\n";
         exit(1);
     }
 
@@ -795,6 +822,12 @@ ConnectedJoyCon WaitForJoyCon(const std::wstring& prompt)
             else if (characteristic.Uuid() == guid(WRITE_COMMAND_UUID))
                 cj.writeChar = characteristic;
         }
+    }
+
+    if (!cj.inputChar || !cj.writeChar) {
+        std::wcerr << L"Joy-Con connected, but required GATT characteristics were not found.\n";
+        std::wcerr << L"Try removing the device from Windows Bluetooth settings and pairing it again.\n";
+        exit(1);
     }
 
     return cj;
@@ -812,6 +845,8 @@ struct PlayerConfig {
     JoyConSide joyconSide;
     JoyConOrientation joyconOrientation;
     GyroSource gyroSource;
+    GyroMode gyroMode;
+    MotionProfile motionProfile;
 };
 
 // For single Joy-Con players, store controller + JoyCon info to keep alive
@@ -846,6 +881,9 @@ struct DualJoyConPlayer {
     ConnectedJoyCon leftJoyCon;
     ConnectedJoyCon rightJoyCon;
     GyroSource gyroSource;
+    GyroMode gyroMode;
+    MotionProfile motionProfile;
+    uint8_t dsuSlot = 0;
     PVIGEM_TARGET ds4Controller;
     std::atomic<bool> running;
     std::thread updateThread;
@@ -856,9 +894,6 @@ struct ProControllerPlayer {
     ConnectedJoyCon controller;
     PVIGEM_TARGET ds4Controller;
 };
-
-// Declare the Pro Controller report generator (implement in JoyConDecoder.cpp)
-DS4_REPORT_EX GenerateProControllerReport(const std::vector<uint8_t>& buffer);
 
 int main()
 {
@@ -932,7 +967,51 @@ int main()
 
         }
 
+        if (config.controllerType == SingleJoyCon || config.controllerType == DualJoyCon || config.controllerType == ProController) {
+            while (true) {
+                std::wcout << L"  Gyro output? (1=DS4 Raw, 2=DS4 Switch Emulator, 3=DSU UDP): ";
+                std::getline(std::wcin, line);
+                if (line == L"1" || line.empty()) {
+                    config.gyroMode = GyroMode::DS4Raw;
+                    config.motionProfile = MotionProfile::Raw;
+                    break;
+                }
+                if (line == L"2") {
+                    config.gyroMode = GyroMode::DS4SwitchEmu;
+                    config.motionProfile = MotionProfile::SwitchEmu;
+                    break;
+                }
+                if (line == L"3") {
+                    config.gyroMode = GyroMode::DsuUdp;
+                    config.motionProfile = MotionProfile::SwitchEmu;
+                    std::wcout << L"  Configure your emulator's Cemuhook/DSU motion source at 127.0.0.1:26760.\n";
+                    if (config.controllerType == DualJoyCon && config.gyroSource == GyroSource::Both) {
+                        std::wcout << L"  Tip: choose Right as gyro source for pointer/sword motion when using the right Joy-Con.\n";
+                    }
+                    break;
+                }
+                std::wcout << L"Invalid input. Please enter 1, 2, or 3.\n";
+            }
+        }
+        else {
+            config.gyroMode = GyroMode::DS4Raw;
+            config.motionProfile = MotionProfile::Raw;
+        }
+
         playerConfigs.push_back(config);
+    }
+
+    DsuServer dsuServer;
+    const bool needsDsu = std::any_of(playerConfigs.begin(), playerConfigs.end(), [](const PlayerConfig& config) {
+        return config.gyroMode == GyroMode::DsuUdp;
+    });
+    if (needsDsu) {
+        if (dsuServer.Start()) {
+            std::wcout << L"DSU UDP server listening on 127.0.0.1:26760.\n";
+        }
+        else {
+            std::wcerr << L"Failed to start DSU UDP server on 127.0.0.1:26760.\n";
+        }
     }
 
     InitializeViGEm();
@@ -973,7 +1052,11 @@ int main()
             singlePlayers.push_back({ cj, ds4_controller, config.joyconSide, config.joyconOrientation });
             auto& player = singlePlayers.back();
 
-            player.joycon.inputChar.ValueChanged([joyconSide = player.side, joyconOrientation = player.orientation, &player](GattCharacteristic const&, GattValueChangedEventArgs const& args)
+            if (config.gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
+                dsuServer.SetControllerConnected(static_cast<uint8_t>(i));
+            }
+
+            player.joycon.inputChar.ValueChanged([joyconSide = player.side, joyconOrientation = player.orientation, &player, motionProfile = config.motionProfile, gyroMode = config.gyroMode, dsuSlot = static_cast<uint8_t>(i), &dsuServer](GattCharacteristic const&, GattValueChangedEventArgs const& args)
                 {
                     auto reader = DataReader::FromBuffer(args.CharacteristicValue());
                     std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
@@ -1169,7 +1252,13 @@ int main()
                         }
                     }
 
-                    DS4_REPORT_EX report = GenerateDS4Report(buffer, joyconSide, joyconOrientation);
+                    const MotionProfile ds4Profile = (gyroMode == GyroMode::DsuUdp) ? MotionProfile::Raw : motionProfile;
+                    DS4_REPORT_EX report = GenerateDS4Report(buffer, joyconSide, joyconOrientation, ds4Profile);
+
+                    if (gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
+                        DS4_REPORT_EX dsuReport = GenerateDS4Report(buffer, joyconSide, joyconOrientation, MotionProfile::SwitchEmu);
+                        dsuServer.UpdateController(dsuSlot, dsuReport);
+                    }
 
                     auto ret = vigem_target_ds4_update_ex(vigem_client, player.ds4Controller, report);
                     if (!VIGEM_SUCCESS(ret)) {
@@ -1247,8 +1336,15 @@ int main()
             dualPlayer->leftJoyCon = leftJoyCon;
             dualPlayer->rightJoyCon = rightJoyCon;
             dualPlayer->gyroSource = config.gyroSource;
+            dualPlayer->gyroMode = config.gyroMode;
+            dualPlayer->motionProfile = config.motionProfile;
+            dualPlayer->dsuSlot = static_cast<uint8_t>(i);
             dualPlayer->ds4Controller = ds4Controller;
             dualPlayer->running.store(true);
+
+            if (dualPlayer->gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
+                dsuServer.SetControllerConnected(dualPlayer->dsuSlot);
+            }
 
             std::atomic<std::shared_ptr<std::vector<uint8_t>>> leftBufferAtomic{ std::make_shared<std::vector<uint8_t>>() };
             std::atomic<std::shared_ptr<std::vector<uint8_t>>> rightBufferAtomic{ std::make_shared<std::vector<uint8_t>>() };
@@ -1285,7 +1381,7 @@ int main()
             else
                 std::wcout << L"Failed to enable RIGHT Joy-Con notifications.\n";
 
-            dualPlayer->updateThread = std::thread([dualPlayerPtr = dualPlayer.get(), &leftBufferAtomic, &rightBufferAtomic]()
+            dualPlayer->updateThread = std::thread([dualPlayerPtr = dualPlayer.get(), &leftBufferAtomic, &rightBufferAtomic, &dsuServer]()
                 {
                     while (dualPlayerPtr->running.load(std::memory_order_acquire))
                     {
@@ -1298,7 +1394,13 @@ int main()
                             continue;
                         }
 
-                        DS4_REPORT_EX report = GenerateDualJoyConDS4Report(*leftBuf, *rightBuf, dualPlayerPtr->gyroSource);
+                        const MotionProfile ds4Profile = (dualPlayerPtr->gyroMode == GyroMode::DsuUdp) ? MotionProfile::Raw : dualPlayerPtr->motionProfile;
+                        DS4_REPORT_EX report = GenerateDualJoyConDS4Report(*leftBuf, *rightBuf, dualPlayerPtr->gyroSource, ds4Profile);
+
+                        if (dualPlayerPtr->gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
+                            DS4_REPORT_EX dsuReport = GenerateDualJoyConDS4Report(*leftBuf, *rightBuf, dualPlayerPtr->gyroSource, MotionProfile::SwitchEmu);
+                            dsuServer.UpdateController(dualPlayerPtr->dsuSlot, dsuReport);
+                        }
 
                         auto ret = vigem_target_ds4_update_ex(vigem_client, dualPlayerPtr->ds4Controller, report);
                         if (!VIGEM_SUCCESS(ret))
@@ -1356,20 +1458,27 @@ int main()
                 exit(1);
             }
 
-            proController.inputChar.ValueChanged([ds4_controller](GattCharacteristic const&, GattValueChangedEventArgs const& args) mutable
+            proController.inputChar.ValueChanged([ds4_controller, motionProfile = config.motionProfile, gyroMode = config.gyroMode, dsuSlot = static_cast<uint8_t>(i), &dsuServer](GattCharacteristic const&, GattValueChangedEventArgs const& args) mutable
                 {
                     auto reader = DataReader::FromBuffer(args.CharacteristicValue());
                     std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
                     reader.ReadBytes(buffer);
 
 
-                    DS4_REPORT_EX report = GenerateProControllerReport(buffer);
+                    const MotionProfile ds4Profile = (gyroMode == GyroMode::DsuUdp) ? MotionProfile::Raw : motionProfile;
+                    DS4_REPORT_EX report = GenerateProControllerReport(buffer, ds4Profile);
 
                     // Apply GL/GR button mappings
                     ApplyGLGRMappings(report, buffer);
 
                     // Handle special buttons (Screenshot -> F12, C button)
                     HandleSpecialProButtons(buffer);
+
+                    if (gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
+                        DS4_REPORT_EX dsuReport = GenerateProControllerReport(buffer, MotionProfile::SwitchEmu);
+                        ApplyGLGRMappings(dsuReport, buffer);
+                        dsuServer.UpdateController(dsuSlot, dsuReport);
+                    }
 
                     auto ret = vigem_target_ds4_update_ex(vigem_client, ds4_controller, report);
                     if (!VIGEM_SUCCESS(ret)) {
@@ -1391,6 +1500,10 @@ int main()
                 std::wcout << L"Pro Controller notifications enabled.\n";
             else
                 std::wcout << L"Failed to enable Pro Controller notifications.\n";
+
+            if (config.gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
+                dsuServer.SetControllerConnected(static_cast<uint8_t>(i));
+            }
 
             std::wcout << L"Press Enter to continue...\n";
             std::wstring dummy;
@@ -1516,6 +1629,8 @@ int main()
         vigem_free(vigem_client);
         vigem_client = nullptr;
     }
+
+    dsuServer.Stop();
 
     return 0;
 }

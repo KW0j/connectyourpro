@@ -13,6 +13,28 @@ int16_t to_signed_16(uint8_t lsb, uint8_t msb) {
     return static_cast<int16_t>((msb << 8) | lsb);
 }
 
+namespace {
+constexpr bool kSwitchEmuInvertPitch = false;
+constexpr bool kSwitchEmuInvertYaw = true;
+constexpr bool kSwitchEmuInvertRoll = false;
+constexpr bool kSwitchEmuSwapYawRoll = true;
+
+SHORT ApplySign(SHORT value, bool invert)
+{
+    return invert ? static_cast<SHORT>(-value) : value;
+}
+
+void ApplyMotionToReport(DS4_REPORT_EX& report, const MotionData& motion)
+{
+    report.Report.wAccelX = motion.accelX;
+    report.Report.wAccelY = motion.accelY;
+    report.Report.wAccelZ = motion.accelZ;
+    report.Report.wGyroX = motion.gyroX;
+    report.Report.wGyroY = motion.gyroY;
+    report.Report.wGyroZ = motion.gyroZ;
+}
+}
+
 constexpr uint32_t BUTTON_A_MASK_RIGHT = 0x000800;
 constexpr uint32_t BUTTON_B_MASK_RIGHT = 0x000200;
 constexpr uint32_t BUTTON_X_MASK_RIGHT = 0x000400;
@@ -109,7 +131,49 @@ static void decode_triggers_shoulders(uint32_t state, bool isLeft, bool upright,
     }
 }
 
-DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide side, JoyConOrientation orientation) {
+MotionData DecodeMotionRaw(const std::vector<uint8_t>& buffer)
+{
+    MotionData motion{};
+    if (buffer.size() < 0x3C) {
+        return motion;
+    }
+
+    motion.accelX = to_signed_16(buffer[0x30], buffer[0x31]);
+    motion.accelY = to_signed_16(buffer[0x32], buffer[0x33]);
+    motion.accelZ = to_signed_16(buffer[0x34], buffer[0x35]);
+    motion.gyroX = to_signed_16(buffer[0x36], buffer[0x37]);
+    motion.gyroY = to_signed_16(buffer[0x38], buffer[0x39]);
+    motion.gyroZ = to_signed_16(buffer[0x3A], buffer[0x3B]);
+    return motion;
+}
+
+MotionData TransformMotion(MotionData raw, MotionProfile profile, JoyConSide)
+{
+    if (profile == MotionProfile::Raw) {
+        return raw;
+    }
+
+    MotionData out = raw;
+    SHORT pitch = raw.gyroX;
+    SHORT yaw = raw.gyroY;
+    SHORT roll = raw.gyroZ;
+
+    if (kSwitchEmuSwapYawRoll) {
+        std::swap(yaw, roll);
+    }
+
+    out.gyroX = ApplySign(pitch, kSwitchEmuInvertPitch);
+    out.gyroY = ApplySign(yaw, kSwitchEmuInvertYaw);
+    out.gyroZ = ApplySign(roll, kSwitchEmuInvertRoll);
+    return out;
+}
+
+MotionData DecodeMotion(const std::vector<uint8_t>& buffer)
+{
+    return DecodeMotionRaw(buffer);
+}
+
+DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide side, JoyConOrientation orientation, MotionProfile profile) {
     DS4_REPORT_EX report{};
     DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&report.Report));
 
@@ -174,18 +238,12 @@ DS4_REPORT_EX GenerateDS4Report(const std::vector<uint8_t>& buffer, JoyConSide s
     report.Report.bThumbLX = static_cast<BYTE>((stickX / 32767.0f) * 127 + 128);
     report.Report.bThumbLY = static_cast<BYTE>((stickY / 32767.0f) * 127 + 128);
 
-    report.Report.wAccelX = to_signed_16(buffer[0x30], buffer[0x31]);
-    report.Report.wAccelY = to_signed_16(buffer[0x32], buffer[0x33]);
-    report.Report.wAccelZ = to_signed_16(buffer[0x34], buffer[0x35]);
-
-    report.Report.wGyroX = to_signed_16(buffer[0x36], buffer[0x37]);
-    report.Report.wGyroY = to_signed_16(buffer[0x38], buffer[0x39]);
-    report.Report.wGyroZ = to_signed_16(buffer[0x3A], buffer[0x3B]);
+    ApplyMotionToReport(report, TransformMotion(DecodeMotionRaw(buffer), profile, side));
 
     return report;
 }
 
-DS4_REPORT_EX GenerateDualJoyConDS4Report(const std::vector<uint8_t>& leftBuffer, const std::vector<uint8_t>& rightBuffer, GyroSource gyroSource)
+DS4_REPORT_EX GenerateDualJoyConDS4Report(const std::vector<uint8_t>& leftBuffer, const std::vector<uint8_t>& rightBuffer, GyroSource gyroSource, MotionProfile profile)
 {
     DS4_REPORT_EX report{};
     DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&report.Report));
@@ -196,12 +254,12 @@ DS4_REPORT_EX GenerateDualJoyConDS4Report(const std::vector<uint8_t>& leftBuffer
 
     DS4_REPORT_EX leftReport{};
     if (leftBuffer.size() >= 0x3C) {
-        leftReport = GenerateDS4Report(leftBuffer, JoyConSide::Left, JoyConOrientation::Upright);
+        leftReport = GenerateDS4Report(leftBuffer, JoyConSide::Left, JoyConOrientation::Upright, profile);
     }
 
     DS4_REPORT_EX rightReport{};
     if (rightBuffer.size() >= 0x3C) {
-        rightReport = GenerateDS4Report(rightBuffer, JoyConSide::Right, JoyConOrientation::Upright);
+        rightReport = GenerateDS4Report(rightBuffer, JoyConSide::Right, JoyConOrientation::Upright, profile);
     }
 
     USHORT leftDpad = leftReport.Report.wButtons & 0xF;
@@ -333,7 +391,7 @@ constexpr uint64_t BUTTON_L_THUMB = 0x000008000000;
 constexpr uint64_t TRIGGER_LT_MASK = 0x000000800000;
 constexpr uint64_t TRIGGER_RT_MASK = 0x008000000000;
 
-DS4_REPORT_EX GenerateProControllerReport(const std::vector<uint8_t>& buffer)
+DS4_REPORT_EX GenerateProControllerReport(const std::vector<uint8_t>& buffer, MotionProfile profile)
 {
     DS4_REPORT_EX report{};
     DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&report.Report));
@@ -408,12 +466,7 @@ DS4_REPORT_EX GenerateProControllerReport(const std::vector<uint8_t>& buffer)
     report.Report.bThumbRX = static_cast<uint8_t>((rx / 32767.0f) * 127 + 128);
     report.Report.bThumbRY = static_cast<uint8_t>((ry / 32767.0f) * 127 + 128);
 
-    report.Report.wAccelX = to_signed_16(buffer[0x30], buffer[0x31]);
-    report.Report.wAccelY = to_signed_16(buffer[0x32], buffer[0x33]);
-    report.Report.wAccelZ = to_signed_16(buffer[0x34], buffer[0x35]);
-    report.Report.wGyroX = to_signed_16(buffer[0x36], buffer[0x37]);
-    report.Report.wGyroY = to_signed_16(buffer[0x38], buffer[0x39]);
-    report.Report.wGyroZ = to_signed_16(buffer[0x3A], buffer[0x3B]);
+    ApplyMotionToReport(report, TransformMotion(DecodeMotionRaw(buffer), profile, JoyConSide::Right));
 
     return report;
 }
@@ -476,12 +529,7 @@ DS4_REPORT_EX GenerateNSOGCReport(const std::vector<uint8_t>& buffer)
     report.Report.bThumbRX = static_cast<uint8_t>((rx / 32767.0f) * 127 + 128);
     report.Report.bThumbRY = static_cast<uint8_t>((ry / 32767.0f) * 127 + 128);
 
-    report.Report.wAccelX = to_signed_16(buffer[0x30], buffer[0x31]);
-    report.Report.wAccelY = to_signed_16(buffer[0x32], buffer[0x33]);
-    report.Report.wAccelZ = to_signed_16(buffer[0x34], buffer[0x35]);
-    report.Report.wGyroX = to_signed_16(buffer[0x36], buffer[0x37]);
-    report.Report.wGyroY = to_signed_16(buffer[0x38], buffer[0x39]);
-    report.Report.wGyroZ = to_signed_16(buffer[0x3A], buffer[0x3B]);
+    ApplyMotionToReport(report, DecodeMotionRaw(buffer));
 
     return report;
 }
