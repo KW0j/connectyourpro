@@ -16,8 +16,12 @@
 #include <fstream>
 #include <sstream>
 #include <map>
+#include <chrono>
+#include <iomanip>
+#include <string>
 #include <conio.h>  // For _kbhit()
 #include "JoyConDecoder.h"
+#include "DsuServer.h"
 #include <Windows.h>
 
 #include <ViGEm/Client.h>
@@ -75,6 +79,145 @@ const std::string CONFIG_FILE = "joycon2cpp_config.json";
 ProControllerConfig g_proControllerConfig;
 
 PVIGEM_CLIENT vigem_client = nullptr;
+
+using SteadyClock = std::chrono::steady_clock;
+using TimePoint = SteadyClock::time_point;
+
+enum class UpdatePolicy {
+    LowLatency,
+    Balanced120Hz,
+    Legacy60Hz
+};
+
+const char* UpdatePolicyName(UpdatePolicy policy)
+{
+    switch (policy) {
+        case UpdatePolicy::LowLatency: return "LowLatency";
+        case UpdatePolicy::Balanced120Hz: return "Balanced120Hz";
+        case UpdatePolicy::Legacy60Hz: return "Legacy60Hz";
+        default: return "Unknown";
+    }
+}
+
+const char* ControllerTypeName(int controllerType)
+{
+    switch (controllerType) {
+        case 1: return "SingleJoyCon";
+        case 2: return "DualJoyCon";
+        case 3: return "ProController";
+        case 4: return "NSOGCController";
+        default: return "Unknown";
+    }
+}
+
+struct RuntimeOptions {
+    bool latencyMetrics = false;
+    UpdatePolicy updatePolicy = UpdatePolicy::LowLatency;
+    std::string latencyCsvPath = "latency_benchmark.csv";
+};
+
+RuntimeOptions g_runtimeOptions;
+
+class LatencyCsvLogger {
+public:
+    bool Start(const std::string& path)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_file.open(path, std::ios::out | std::ios::trunc);
+        if (!m_file.is_open()) {
+            return false;
+        }
+
+        m_file << "mode,controller_type,event_index,ble_delta_ms,buffer_age_left_ms,buffer_age_right_ms,decode_to_vigem_us,total_pipeline_us\n";
+        m_enabled = true;
+        return true;
+    }
+
+    bool Enabled() const
+    {
+        return m_enabled.load(std::memory_order_acquire);
+    }
+
+    void Record(
+        UpdatePolicy policy,
+        const char* controllerType,
+        uint64_t eventIndex,
+        double bleDeltaMs,
+        double bufferAgeLeftMs,
+        double bufferAgeRightMs,
+        double decodeToVigemUs,
+        double totalPipelineUs)
+    {
+        if (!Enabled()) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_file.is_open()) {
+            return;
+        }
+
+        m_file << UpdatePolicyName(policy) << ','
+               << controllerType << ','
+               << eventIndex << ','
+               << std::fixed << std::setprecision(3)
+               << bleDeltaMs << ','
+               << bufferAgeLeftMs << ','
+               << bufferAgeRightMs << ','
+               << std::setprecision(1)
+               << decodeToVigemUs << ','
+               << totalPipelineUs << '\n';
+    }
+
+private:
+    std::atomic<bool> m_enabled{ false };
+    std::mutex m_mutex;
+    std::ofstream m_file;
+};
+
+LatencyCsvLogger g_latencyLogger;
+
+double MillisecondsBetween(TimePoint start, TimePoint end)
+{
+    if (start == TimePoint{}) {
+        return -1.0;
+    }
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+double MicrosecondsBetween(TimePoint start, TimePoint end)
+{
+    return std::chrono::duration<double, std::micro>(end - start).count();
+}
+
+std::chrono::microseconds PolicyInterval(UpdatePolicy policy)
+{
+    switch (policy) {
+        case UpdatePolicy::Balanced120Hz:
+            return std::chrono::microseconds(8333);
+        case UpdatePolicy::Legacy60Hz:
+            return std::chrono::microseconds(16667);
+        case UpdatePolicy::LowLatency:
+        default:
+            return std::chrono::microseconds(0);
+    }
+}
+
+bool ShouldEmitForPolicy(UpdatePolicy policy, TimePoint& lastEmit, TimePoint now)
+{
+    const auto interval = PolicyInterval(policy);
+    if (interval.count() == 0 || lastEmit == TimePoint{} || now - lastEmit >= interval) {
+        lastEmit = now;
+        return true;
+    }
+    return false;
+}
+
+struct LatencyTracker {
+    TimePoint lastBleTime{};
+    TimePoint lastEmitTime{};
+    uint64_t eventIndex = 0;
+};
 
 void InitializeViGEm()
 {
@@ -719,6 +862,22 @@ struct ConnectedJoyCon {
     GattCharacteristic writeChar = nullptr;
 };
 
+const wchar_t* GattStatusToString(GattCommunicationStatus status)
+{
+    switch (status) {
+        case GattCommunicationStatus::Success:
+            return L"Success";
+        case GattCommunicationStatus::Unreachable:
+            return L"Unreachable";
+        case GattCommunicationStatus::ProtocolError:
+            return L"ProtocolError";
+        case GattCommunicationStatus::AccessDenied:
+            return L"AccessDenied";
+        default:
+            return L"Unknown";
+    }
+}
+
 ConnectedJoyCon WaitForJoyCon(const std::wstring& prompt)
 {
     std::wcout << prompt << L"\n";
@@ -777,10 +936,20 @@ ConnectedJoyCon WaitForJoyCon(const std::wstring& prompt)
 
     cj.device = device;
 
-    auto servicesResult = device.GetGattServicesAsync().get();
-    if (servicesResult.Status() != GattCommunicationStatus::Success)
-    {
-        std::wcerr << L"Failed to get GATT services.\n";
+    GattDeviceServicesResult servicesResult = nullptr;
+    for (int attempt = 1; attempt <= 10; ++attempt) {
+        servicesResult = device.GetGattServicesAsync(BluetoothCacheMode::Uncached).get();
+        if (servicesResult.Status() == GattCommunicationStatus::Success) {
+            break;
+        }
+
+        std::wcerr << L"Failed to get GATT services (attempt " << attempt
+            << L"/10, status=" << GattStatusToString(servicesResult.Status()) << L"). Retrying...\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    if (!servicesResult || servicesResult.Status() != GattCommunicationStatus::Success) {
+        std::wcerr << L"Failed to get GATT services. Remove the Joy-Con from Windows Bluetooth settings, turn it off, then pair it again.\n";
         exit(1);
     }
 
@@ -795,6 +964,12 @@ ConnectedJoyCon WaitForJoyCon(const std::wstring& prompt)
             else if (characteristic.Uuid() == guid(WRITE_COMMAND_UUID))
                 cj.writeChar = characteristic;
         }
+    }
+
+    if (!cj.inputChar || !cj.writeChar) {
+        std::wcerr << L"Joy-Con connected, but required GATT characteristics were not found.\n";
+        std::wcerr << L"Try removing the device from Windows Bluetooth settings and pairing it again.\n";
+        exit(1);
     }
 
     return cj;
@@ -812,6 +987,8 @@ struct PlayerConfig {
     JoyConSide joyconSide;
     JoyConOrientation joyconOrientation;
     GyroSource gyroSource;
+    GyroMode gyroMode;
+    MotionProfile motionProfile;
 };
 
 // For single Joy-Con players, store controller + JoyCon info to keep alive
@@ -839,6 +1016,27 @@ struct SingleJoyConPlayer {
     bool leftBtnPressed = false;
     bool rightBtnPressed = false;
     bool middleBtnPressed = false;
+
+    LatencyTracker latency;
+};
+
+struct TimedInputBuffer {
+    std::vector<uint8_t> buffer;
+    TimePoint receivedAt{};
+    double bleDeltaMs = -1.0;
+    uint64_t sequence = 0;
+};
+
+struct DualJoyConSharedState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    TimedInputBuffer left;
+    TimedInputBuffer right;
+    TimePoint lastLeftBleTime{};
+    TimePoint lastRightBleTime{};
+    TimePoint lastEmitTime{};
+    uint64_t sequence = 0;
+    uint64_t eventIndex = 0;
 };
 
 // For dual Joy-Con players, store both JoyCons, controller, thread, and running flag
@@ -846,23 +1044,76 @@ struct DualJoyConPlayer {
     ConnectedJoyCon leftJoyCon;
     ConnectedJoyCon rightJoyCon;
     GyroSource gyroSource;
+    GyroMode gyroMode;
+    MotionProfile motionProfile;
+    uint8_t dsuSlot = 0;
     PVIGEM_TARGET ds4Controller;
     std::atomic<bool> running;
     std::thread updateThread;
+    std::shared_ptr<DualJoyConSharedState> sharedState;
 };
 
 // For Pro Controller players
 struct ProControllerPlayer {
     ConnectedJoyCon controller;
     PVIGEM_TARGET ds4Controller;
+    LatencyTracker latency;
 };
 
-// Declare the Pro Controller report generator (implement in JoyConDecoder.cpp)
-DS4_REPORT_EX GenerateProControllerReport(const std::vector<uint8_t>& buffer);
-
-int main()
+int main(int argc, char* argv[])
 {
     init_apartment();
+
+    for (int arg = 1; arg < argc; ++arg) {
+        const std::string option = argv[arg];
+        if (option == "--latency-test" || option == "--latency-benchmark") {
+            g_runtimeOptions.latencyMetrics = true;
+        }
+        else if (option == "--update-policy" && arg + 1 < argc) {
+            const std::string value = argv[++arg];
+            if (value == "low" || value == "LowLatency") {
+                g_runtimeOptions.updatePolicy = UpdatePolicy::LowLatency;
+            }
+            else if (value == "balanced" || value == "Balanced120Hz") {
+                g_runtimeOptions.updatePolicy = UpdatePolicy::Balanced120Hz;
+            }
+            else if (value == "legacy" || value == "Legacy60Hz") {
+                g_runtimeOptions.updatePolicy = UpdatePolicy::Legacy60Hz;
+            }
+        }
+        else if (option == "--latency-csv" && arg + 1 < argc) {
+            g_runtimeOptions.latencyCsvPath = argv[++arg];
+        }
+    }
+
+    std::wstring metricsLine;
+    std::wcout << L"Enable latency metrics? (y/N): ";
+    std::getline(std::wcin, metricsLine);
+    if (metricsLine == L"y" || metricsLine == L"Y") {
+        g_runtimeOptions.latencyMetrics = true;
+    }
+
+    std::wstring policyLine;
+    std::wcout << L"Update policy? (1=LowLatency, 2=Balanced120Hz, 3=Legacy60Hz) [1]: ";
+    std::getline(std::wcin, policyLine);
+    if (policyLine == L"2") {
+        g_runtimeOptions.updatePolicy = UpdatePolicy::Balanced120Hz;
+    }
+    else if (policyLine == L"3") {
+        g_runtimeOptions.updatePolicy = UpdatePolicy::Legacy60Hz;
+    }
+
+    if (g_runtimeOptions.latencyMetrics) {
+        if (g_latencyLogger.Start(g_runtimeOptions.latencyCsvPath)) {
+            const std::wstring csvPath(g_runtimeOptions.latencyCsvPath.begin(), g_runtimeOptions.latencyCsvPath.end());
+            std::wcout << L"Latency metrics enabled: " << csvPath << L"\n";
+        }
+        else {
+            std::wcerr << L"Warning: could not open latency CSV. Metrics disabled.\n";
+        }
+    }
+    const std::string policyName = UpdatePolicyName(g_runtimeOptions.updatePolicy);
+    std::wcout << L"Update policy: " << std::wstring(policyName.begin(), policyName.end()) << L"\n";
 
     int numPlayers;
     std::wcout << L"How many players? ";
@@ -932,7 +1183,51 @@ int main()
 
         }
 
+        if (config.controllerType == SingleJoyCon || config.controllerType == DualJoyCon || config.controllerType == ProController) {
+            while (true) {
+                std::wcout << L"  Gyro output? (1=DS4 Raw, 2=DS4 Switch Emulator, 3=DSU UDP): ";
+                std::getline(std::wcin, line);
+                if (line == L"1" || line.empty()) {
+                    config.gyroMode = GyroMode::DS4Raw;
+                    config.motionProfile = MotionProfile::Raw;
+                    break;
+                }
+                if (line == L"2") {
+                    config.gyroMode = GyroMode::DS4SwitchEmu;
+                    config.motionProfile = MotionProfile::SwitchEmu;
+                    break;
+                }
+                if (line == L"3") {
+                    config.gyroMode = GyroMode::DsuUdp;
+                    config.motionProfile = MotionProfile::SwitchEmu;
+                    std::wcout << L"  Configure your emulator's Cemuhook/DSU motion source at 127.0.0.1:26760.\n";
+                    if (config.controllerType == DualJoyCon && config.gyroSource == GyroSource::Both) {
+                        std::wcout << L"  Tip: choose Right as gyro source for pointer/sword motion when using the right Joy-Con.\n";
+                    }
+                    break;
+                }
+                std::wcout << L"Invalid input. Please enter 1, 2, or 3.\n";
+            }
+        }
+        else {
+            config.gyroMode = GyroMode::DS4Raw;
+            config.motionProfile = MotionProfile::Raw;
+        }
+
         playerConfigs.push_back(config);
+    }
+
+    DsuServer dsuServer;
+    const bool needsDsu = std::any_of(playerConfigs.begin(), playerConfigs.end(), [](const PlayerConfig& config) {
+        return config.gyroMode == GyroMode::DsuUdp;
+    });
+    if (needsDsu) {
+        if (dsuServer.Start()) {
+            std::wcout << L"DSU UDP server listening on 127.0.0.1:26760.\n";
+        }
+        else {
+            std::wcerr << L"Failed to start DSU UDP server on 127.0.0.1:26760.\n";
+        }
     }
 
     InitializeViGEm();
@@ -941,6 +1236,9 @@ int main()
     std::vector<SingleJoyConPlayer> singlePlayers;
     std::vector<std::unique_ptr<DualJoyConPlayer>> dualPlayers;
     std::vector<ProControllerPlayer> proPlayers;
+    singlePlayers.reserve(numPlayers);
+    dualPlayers.reserve(numPlayers);
+    proPlayers.reserve(numPlayers);
 
     for (int i = 0; i < numPlayers; ++i) {
         auto& config = playerConfigs[i];
@@ -956,7 +1254,7 @@ int main()
             try {
                 auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
                 cj.device.RequestPreferredConnectionParameters(connectionParams);
-                std::wcout << L"Requested ThroughputOptimized connection parameters for lower latency.\n";
+                std::wcout << L"Requested ThroughputOptimized connection parameters for lower latency (Windows may ignore this request).\n";
             }
             catch (...) {
                 std::wcout << L"Warning: Could not request preferred connection parameters.\n";
@@ -973,11 +1271,18 @@ int main()
             singlePlayers.push_back({ cj, ds4_controller, config.joyconSide, config.joyconOrientation });
             auto& player = singlePlayers.back();
 
-            player.joycon.inputChar.ValueChanged([joyconSide = player.side, joyconOrientation = player.orientation, &player](GattCharacteristic const&, GattValueChangedEventArgs const& args)
+            if (config.gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
+                dsuServer.SetControllerConnected(static_cast<uint8_t>(i));
+            }
+
+            player.joycon.inputChar.ValueChanged([joyconSide = player.side, joyconOrientation = player.orientation, &player, motionProfile = config.motionProfile, gyroMode = config.gyroMode, dsuSlot = static_cast<uint8_t>(i), &dsuServer](GattCharacteristic const&, GattValueChangedEventArgs const& args)
                 {
+                    const auto notificationReceived = SteadyClock::now();
                     auto reader = DataReader::FromBuffer(args.CharacteristicValue());
                     std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
                     reader.ReadBytes(buffer);
+                    const double bleDeltaMs = MillisecondsBetween(player.latency.lastBleTime, notificationReceived);
+                    player.latency.lastBleTime = notificationReceived;
 
                     // Optical Mouse Toggle Logic (Only for Right Joy-Con/Joy-Con 2)
                     if (joyconSide == JoyConSide::Right) {
@@ -1169,12 +1474,34 @@ int main()
                         }
                     }
 
-                    DS4_REPORT_EX report = GenerateDS4Report(buffer, joyconSide, joyconOrientation);
+                    if (!ShouldEmitForPolicy(g_runtimeOptions.updatePolicy, player.latency.lastEmitTime, SteadyClock::now())) {
+                        return;
+                    }
+
+                    const auto decodeStart = SteadyClock::now();
+                    const MotionProfile ds4Profile = (gyroMode == GyroMode::DsuUdp) ? MotionProfile::Raw : motionProfile;
+                    DS4_REPORT_EX report = GenerateDS4Report(buffer, joyconSide, joyconOrientation, ds4Profile);
+
+                    if (gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
+                        DS4_REPORT_EX dsuReport = GenerateDS4Report(buffer, joyconSide, joyconOrientation, MotionProfile::SwitchEmu);
+                        dsuServer.UpdateController(dsuSlot, dsuReport);
+                    }
 
                     auto ret = vigem_target_ds4_update_ex(vigem_client, player.ds4Controller, report);
+                    const auto vigemComplete = SteadyClock::now();
                     if (!VIGEM_SUCCESS(ret)) {
                          // std::wcerr << L"Failed to update DS4 EX report: 0x" << std::hex << ret << L"\n";
                     }
+
+                    g_latencyLogger.Record(
+                        g_runtimeOptions.updatePolicy,
+                        ControllerTypeName(SingleJoyCon),
+                        ++player.latency.eventIndex,
+                        bleDeltaMs,
+                        0.0,
+                        -1.0,
+                        MicrosecondsBetween(decodeStart, vigemComplete),
+                        MicrosecondsBetween(notificationReceived, vigemComplete));
                 });
 
             auto status = player.joycon.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
@@ -1210,7 +1537,7 @@ int main()
             try {
                 auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
                 rightJoyCon.device.RequestPreferredConnectionParameters(connectionParams);
-                std::wcout << L"Requested ThroughputOptimized connection parameters for RIGHT Joy-Con.\n";
+                std::wcout << L"Requested ThroughputOptimized connection parameters for RIGHT Joy-Con (Windows may ignore this request).\n";
             }
             catch (...) {
                 std::wcout << L"Warning: Could not request preferred connection parameters for RIGHT Joy-Con.\n";
@@ -1229,7 +1556,7 @@ int main()
             try {
                 auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
                 leftJoyCon.device.RequestPreferredConnectionParameters(connectionParams);
-                std::wcout << L"Requested ThroughputOptimized connection parameters for LEFT Joy-Con.\n";
+                std::wcout << L"Requested ThroughputOptimized connection parameters for LEFT Joy-Con (Windows may ignore this request).\n";
             }
             catch (...) {
                 std::wcout << L"Warning: Could not request preferred connection parameters for LEFT Joy-Con.\n";
@@ -1247,18 +1574,35 @@ int main()
             dualPlayer->leftJoyCon = leftJoyCon;
             dualPlayer->rightJoyCon = rightJoyCon;
             dualPlayer->gyroSource = config.gyroSource;
+            dualPlayer->gyroMode = config.gyroMode;
+            dualPlayer->motionProfile = config.motionProfile;
+            dualPlayer->dsuSlot = static_cast<uint8_t>(i);
             dualPlayer->ds4Controller = ds4Controller;
             dualPlayer->running.store(true);
+            dualPlayer->sharedState = std::make_shared<DualJoyConSharedState>();
 
-            std::atomic<std::shared_ptr<std::vector<uint8_t>>> leftBufferAtomic{ std::make_shared<std::vector<uint8_t>>() };
-            std::atomic<std::shared_ptr<std::vector<uint8_t>>> rightBufferAtomic{ std::make_shared<std::vector<uint8_t>>() };
+            if (dualPlayer->gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
+                dsuServer.SetControllerConnected(dualPlayer->dsuSlot);
+            }
 
-            dualPlayer->leftJoyCon.inputChar.ValueChanged([&leftBufferAtomic](GattCharacteristic const&, GattValueChangedEventArgs const& args)
+            auto dualSharedState = dualPlayer->sharedState;
+
+            dualPlayer->leftJoyCon.inputChar.ValueChanged([dualSharedState](GattCharacteristic const&, GattValueChangedEventArgs const& args)
                 {
+                    const auto receivedAt = SteadyClock::now();
                     auto reader = DataReader::FromBuffer(args.CharacteristicValue());
-                    auto buf = std::make_shared<std::vector<uint8_t>>(reader.UnconsumedBufferLength());
-                    reader.ReadBytes(*buf);
-                    leftBufferAtomic.store(buf, std::memory_order_release);
+                    std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
+                    reader.ReadBytes(buffer);
+
+                    {
+                        std::lock_guard<std::mutex> lock(dualSharedState->mutex);
+                        dualSharedState->left.bleDeltaMs = MillisecondsBetween(dualSharedState->lastLeftBleTime, receivedAt);
+                        dualSharedState->lastLeftBleTime = receivedAt;
+                        dualSharedState->left.buffer = std::move(buffer);
+                        dualSharedState->left.receivedAt = receivedAt;
+                        dualSharedState->left.sequence = ++dualSharedState->sequence;
+                    }
+                    dualSharedState->cv.notify_one();
                 });
 
             auto statusLeft = dualPlayer->leftJoyCon.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
@@ -1269,12 +1613,22 @@ int main()
             else
                 std::wcout << L"Failed to enable LEFT Joy-Con notifications.\n";
 
-            dualPlayer->rightJoyCon.inputChar.ValueChanged([&rightBufferAtomic](GattCharacteristic const&, GattValueChangedEventArgs const& args)
+            dualPlayer->rightJoyCon.inputChar.ValueChanged([dualSharedState](GattCharacteristic const&, GattValueChangedEventArgs const& args)
                 {
+                    const auto receivedAt = SteadyClock::now();
                     auto reader = DataReader::FromBuffer(args.CharacteristicValue());
-                    auto buf = std::make_shared<std::vector<uint8_t>>(reader.UnconsumedBufferLength());
-                    reader.ReadBytes(*buf);
-                    rightBufferAtomic.store(buf, std::memory_order_release);
+                    std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
+                    reader.ReadBytes(buffer);
+
+                    {
+                        std::lock_guard<std::mutex> lock(dualSharedState->mutex);
+                        dualSharedState->right.bleDeltaMs = MillisecondsBetween(dualSharedState->lastRightBleTime, receivedAt);
+                        dualSharedState->lastRightBleTime = receivedAt;
+                        dualSharedState->right.buffer = std::move(buffer);
+                        dualSharedState->right.receivedAt = receivedAt;
+                        dualSharedState->right.sequence = ++dualSharedState->sequence;
+                    }
+                    dualSharedState->cv.notify_one();
                 });
 
             auto statusRight = dualPlayer->rightJoyCon.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
@@ -1285,28 +1639,76 @@ int main()
             else
                 std::wcout << L"Failed to enable RIGHT Joy-Con notifications.\n";
 
-            dualPlayer->updateThread = std::thread([dualPlayerPtr = dualPlayer.get(), &leftBufferAtomic, &rightBufferAtomic]()
+            dualPlayer->updateThread = std::thread([dualPlayerPtr = dualPlayer.get(), dualSharedState, &dsuServer]()
                 {
+                    uint64_t lastProcessedSequence = 0;
                     while (dualPlayerPtr->running.load(std::memory_order_acquire))
                     {
-                        auto leftBuf = leftBufferAtomic.load(std::memory_order_acquire);
-                        auto rightBuf = rightBufferAtomic.load(std::memory_order_acquire);
+                        TimedInputBuffer leftSnapshot;
+                        TimedInputBuffer rightSnapshot;
 
-                        if (leftBuf->empty() || rightBuf->empty())
                         {
-                            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                            continue;
+                            std::unique_lock<std::mutex> lock(dualSharedState->mutex);
+                            if (g_runtimeOptions.updatePolicy == UpdatePolicy::Legacy60Hz) {
+                                dualSharedState->cv.wait_for(lock, std::chrono::milliseconds(16), [&]() {
+                                    return !dualPlayerPtr->running.load(std::memory_order_acquire) ||
+                                           dualSharedState->sequence != lastProcessedSequence;
+                                });
+                            }
+                            else {
+                                dualSharedState->cv.wait_for(lock, std::chrono::milliseconds(1), [&]() {
+                                    return !dualPlayerPtr->running.load(std::memory_order_acquire) ||
+                                           dualSharedState->sequence != lastProcessedSequence;
+                                });
+                            }
+
+                            if (!dualPlayerPtr->running.load(std::memory_order_acquire)) {
+                                break;
+                            }
+
+                            if (dualSharedState->left.buffer.empty() || dualSharedState->right.buffer.empty() ||
+                                dualSharedState->sequence == lastProcessedSequence) {
+                                continue;
+                            }
+
+                            const auto now = SteadyClock::now();
+                            if (!ShouldEmitForPolicy(g_runtimeOptions.updatePolicy, dualSharedState->lastEmitTime, now)) {
+                                lastProcessedSequence = dualSharedState->sequence;
+                                continue;
+                            }
+
+                            leftSnapshot = dualSharedState->left;
+                            rightSnapshot = dualSharedState->right;
+                            lastProcessedSequence = dualSharedState->sequence;
                         }
 
-                        DS4_REPORT_EX report = GenerateDualJoyConDS4Report(*leftBuf, *rightBuf, dualPlayerPtr->gyroSource);
+                        const auto decodeStart = SteadyClock::now();
+                        const MotionProfile ds4Profile = (dualPlayerPtr->gyroMode == GyroMode::DsuUdp) ? MotionProfile::Raw : dualPlayerPtr->motionProfile;
+                        DS4_REPORT_EX report = GenerateDualJoyConDS4Report(leftSnapshot.buffer, rightSnapshot.buffer, dualPlayerPtr->gyroSource, ds4Profile);
+
+                        if (dualPlayerPtr->gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
+                            DS4_REPORT_EX dsuReport = GenerateDualJoyConDS4Report(leftSnapshot.buffer, rightSnapshot.buffer, dualPlayerPtr->gyroSource, MotionProfile::SwitchEmu);
+                            dsuServer.UpdateController(dualPlayerPtr->dsuSlot, dsuReport);
+                        }
 
                         auto ret = vigem_target_ds4_update_ex(vigem_client, dualPlayerPtr->ds4Controller, report);
+                        const auto vigemComplete = SteadyClock::now();
                         if (!VIGEM_SUCCESS(ret))
                         {
                             std::wcerr << L"Failed to update DS4 report: 0x" << std::hex << ret << L"\n";
                         }
 
-                        std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60Hz
+                        const auto newestReceivedAt = (leftSnapshot.receivedAt > rightSnapshot.receivedAt) ? leftSnapshot.receivedAt : rightSnapshot.receivedAt;
+                        const double bleDeltaMs = (leftSnapshot.sequence >= rightSnapshot.sequence) ? leftSnapshot.bleDeltaMs : rightSnapshot.bleDeltaMs;
+                        g_latencyLogger.Record(
+                            g_runtimeOptions.updatePolicy,
+                            ControllerTypeName(DualJoyCon),
+                            ++dualSharedState->eventIndex,
+                            bleDeltaMs,
+                            MillisecondsBetween(leftSnapshot.receivedAt, vigemComplete),
+                            MillisecondsBetween(rightSnapshot.receivedAt, vigemComplete),
+                            MicrosecondsBetween(decodeStart, vigemComplete),
+                            MicrosecondsBetween(newestReceivedAt, vigemComplete));
                     }
                 });
 
@@ -1341,8 +1743,9 @@ int main()
             try {
                 auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
                 auto paramResult = proController.device.RequestPreferredConnectionParameters(connectionParams);
+                (void)paramResult;
 
-                std::wcout << L"Requested ThroughputOptimized connection parameters for lower latency.\n";
+                std::wcout << L"Requested ThroughputOptimized connection parameters for lower latency (Windows may ignore this request).\n";
             }
             catch (...) {
                 std::wcout << L"Warning: Could not request preferred connection parameters. Continuing with default settings.\n";
@@ -1356,14 +1759,23 @@ int main()
                 exit(1);
             }
 
-            proController.inputChar.ValueChanged([ds4_controller](GattCharacteristic const&, GattValueChangedEventArgs const& args) mutable
+            auto proLatency = std::make_shared<LatencyTracker>();
+            proController.inputChar.ValueChanged([ds4_controller, motionProfile = config.motionProfile, gyroMode = config.gyroMode, dsuSlot = static_cast<uint8_t>(i), &dsuServer, proLatency](GattCharacteristic const&, GattValueChangedEventArgs const& args) mutable
                 {
+                    const auto notificationReceived = SteadyClock::now();
                     auto reader = DataReader::FromBuffer(args.CharacteristicValue());
                     std::vector<uint8_t> buffer(reader.UnconsumedBufferLength());
                     reader.ReadBytes(buffer);
+                    const double bleDeltaMs = MillisecondsBetween(proLatency->lastBleTime, notificationReceived);
+                    proLatency->lastBleTime = notificationReceived;
 
+                    if (!ShouldEmitForPolicy(g_runtimeOptions.updatePolicy, proLatency->lastEmitTime, SteadyClock::now())) {
+                        return;
+                    }
 
-                    DS4_REPORT_EX report = GenerateProControllerReport(buffer);
+                    const auto decodeStart = SteadyClock::now();
+                    const MotionProfile ds4Profile = (gyroMode == GyroMode::DsuUdp) ? MotionProfile::Raw : motionProfile;
+                    DS4_REPORT_EX report = GenerateProControllerReport(buffer, ds4Profile);
 
                     // Apply GL/GR button mappings
                     ApplyGLGRMappings(report, buffer);
@@ -1371,10 +1783,27 @@ int main()
                     // Handle special buttons (Screenshot -> F12, C button)
                     HandleSpecialProButtons(buffer);
 
+                    if (gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
+                        DS4_REPORT_EX dsuReport = GenerateProControllerReport(buffer, MotionProfile::SwitchEmu);
+                        ApplyGLGRMappings(dsuReport, buffer);
+                        dsuServer.UpdateController(dsuSlot, dsuReport);
+                    }
+
                     auto ret = vigem_target_ds4_update_ex(vigem_client, ds4_controller, report);
+                    const auto vigemComplete = SteadyClock::now();
                     if (!VIGEM_SUCCESS(ret)) {
                         std::wcerr << L"Failed to update DS4 EX report: 0x" << std::hex << ret << L"\n";
                     }
+
+                    g_latencyLogger.Record(
+                        g_runtimeOptions.updatePolicy,
+                        ControllerTypeName(ProController),
+                        ++proLatency->eventIndex,
+                        bleDeltaMs,
+                        0.0,
+                        -1.0,
+                        MicrosecondsBetween(decodeStart, vigemComplete),
+                        MicrosecondsBetween(notificationReceived, vigemComplete));
                 });
 
             auto status = proController.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(
@@ -1392,6 +1821,10 @@ int main()
             else
                 std::wcout << L"Failed to enable Pro Controller notifications.\n";
 
+            if (config.gyroMode == GyroMode::DsuUdp && dsuServer.IsRunning()) {
+                dsuServer.SetControllerConnected(static_cast<uint8_t>(i));
+            }
+
             std::wcout << L"Press Enter to continue...\n";
             std::wstring dummy;
             std::getline(std::wcin, dummy);
@@ -1407,7 +1840,7 @@ int main()
             try {
                 auto connectionParams = BluetoothLEPreferredConnectionParameters::ThroughputOptimized();
                 gcController.device.RequestPreferredConnectionParameters(connectionParams);
-                std::wcout << L"Requested ThroughputOptimized connection parameters for lower latency.\n";
+                std::wcout << L"Requested ThroughputOptimized connection parameters for lower latency (Windows may ignore this request).\n";
             }
             catch (...) {
                 std::wcout << L"Warning: Could not request preferred connection parameters.\n";
@@ -1489,6 +1922,9 @@ int main()
     for (auto& dp : dualPlayers)
     {
         dp->running.store(false);
+        if (dp->sharedState) {
+            dp->sharedState->cv.notify_all();
+        }
         if (dp->updateThread.joinable())
             dp->updateThread.join();
 
@@ -1516,6 +1952,8 @@ int main()
         vigem_free(vigem_client);
         vigem_client = nullptr;
     }
+
+    dsuServer.Stop();
 
     return 0;
 }
