@@ -54,12 +54,14 @@ Both - Uses both joycons.
 Left/Right - Uses either the left or right joycon's data only.
 
 - Gyro Output
-  
-This setting controls where gyro/accel data will be fed to. 
 
-DS4 Raw: Feeds the data directly into the controller. Sometimes, this won't work (e.g if the controller shows up as WGInput, only works if its SDL)
+This setting controls where gyro/accel data will be fed to.
 
-DSU UDP: Feeds the data via DSU for Dolphin/Cemu's DSU Client. Uses the stock Dolphin IP and Port (127.0.0.1, 26760)
+DS4 Raw: Feeds the data directly into the virtual DS4 controller using DS4 axis conventions. May not work in all cases (e.g. if the controller shows up as WGInput instead of SDL).
+
+DS4 Switch Emu: Same as DS4 Raw, but remaps gyro axes to match Switch controller conventions. Use this if motion controls feel wrong or inverted in your emulator.
+
+DSU UDP: Sends gyro/accel data over the DSU protocol to a local DSU client. Uses the standard DSU server address (127.0.0.1, port 26760), compatible with Dolphin, Cemu, and other DSU-supporting emulators.
 
 ## Building from source
 
