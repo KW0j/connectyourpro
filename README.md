@@ -5,7 +5,7 @@
   <img src="docs/logo-light.svg" alt="connectyourpro" width="440">
 </picture>
 
-**All-in-one Nintendo Switch 1/2 Pro Controller on PC solution.**
+**All-in-one Nintendo Switch 1/2 Pro Controller on PC solution**
 
 [Download](https://github.com/KW0j/connectyourpro/releases/latest) · [Website](https://connectyour.pro) · [FAQ](#faq)
 
