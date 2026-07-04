@@ -2,7 +2,7 @@
 
 # connectyour**pro**
 
-**Use your Nintendo Switch Pro Controller (1 & 2) on PC — no browser tricks, no hassle.**
+**All-in-one Nintendo Switch 1/2 Pro Controller on PC solution.**
 
 [Download](https://github.com/KW0j/connectyourpro/releases/latest) · [Website](https://connectyour.pro) · [FAQ](#faq)
 
@@ -57,7 +57,7 @@ The executable lands in `build\testapp.exe`. The installer script lives in
 
 ## FAQ
 
-**The "Pro Controller" entry in Windows game controllers flashes like a Christmas tree.**
+**The "Pro Controller" entry in Windows game controllers shows random button clicks.**
 That's the *physical* controller — after activation it speaks a protocol Windows doesn't
 understand, so the built-in test panel shows garbage. Games use the virtual
 **Xbox 360 Controller** instead. Ignore the Pro Controller entry.
@@ -75,8 +75,8 @@ Yes — Steam sees the virtual Xbox 360 / DS4 pad like any other controller.
 
 ## Credits
 
-- Fork of [joycon2cpp](https://github.com/TheFrano/joycon2cpp) by **Frano (TheFrano)** —
-  the original Switch 2 BLE research and implementation this project grew from.
+- Based on [joycon2cpp](https://github.com/TheFrano/joycon2cpp) by **Frano (TheFrano)** —
+  the original Switch 2 BLE research and implementation this project grew from. many thanks, amazing work!!
 - [procon2tool](https://handheldlegend.github.io/procon2tool/) by **HandheldLegend** —
   the USB activation sequence.
 - **[@german77](https://github.com/german77)** — Joy-Con 2 notification layout research.
