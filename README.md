@@ -1,6 +1,9 @@
 <div align="center">
 
-# connectyour**pro**
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.svg">
+  <img src="docs/logo-light.svg" alt="connectyourpro" width="440">
+</picture>
 
 **All-in-one Nintendo Switch 1/2 Pro Controller on PC solution.**
 
