@@ -7,7 +7,11 @@
 
 **All-in-one Nintendo Switch 1/2 Pro Controller on PC solution**
 
-[Download](https://github.com/KW0j/connectyourpro/releases/latest) · [Website](https://connectyour.pro) · [FAQ](#faq)
+[![Downloads](https://img.shields.io/github/downloads/KW0j/connectyourpro/total?label=downloads&color=e63b3b&style=flat-square)](https://github.com/KW0j/connectyourpro/releases)
+[![Latest release](https://img.shields.io/github/v/release/KW0j/connectyourpro?label=latest&color=2f81f7&style=flat-square)](https://github.com/KW0j/connectyourpro/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-3dc96b?style=flat-square)](LICENSE)
+
+[Download](https://github.com/KW0j/connectyourpro/releases/latest) · [Website](https://connectyour.pro) · [FAQ](#faq) · [Contact](mailto:hello@connectyour.pro)
 
 </div>
 
