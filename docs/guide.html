@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How to connect a Switch 2 Pro Controller to PC (USB &amp; Bluetooth) — connectyourpro guide</title>
+<meta name="description" content="Step-by-step guide: connect a Nintendo Switch 2 Pro Controller (or the original Pro Controller) to a Windows PC over USB or Bluetooth, use it in Steam and any game, fix common problems.">
+<link rel="canonical" href="https://connectyour.pro/guide.html">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="connectyourpro">
+<meta property="og:title" content="How to connect a Switch 2 Pro Controller to PC — full guide">
+<meta property="og:description" content="USB, Bluetooth, Steam, emulators and troubleshooting — everything about using Switch Pro Controllers on PC.">
+<meta property="og:url" content="https://connectyour.pro/guide.html">
+<meta property="og:image" content="https://connectyour.pro/shots/dashboard.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "HowTo",
+  "name": "How to connect a Nintendo Switch 2 Pro Controller to a PC",
+  "description": "Use a free open-source tool to activate the Switch 2 Pro Controller on Windows and play any PC game with it.",
+  "totalTime": "PT2M",
+  "tool": [{ "@type": "HowToTool", "name": "connectyourpro (free Windows app)" }],
+  "step": [
+    { "@type": "HowToStep", "name": "Install connectyourpro", "text": "Download and run the installer from the connectyourpro releases page. It also installs the ViGEmBus driver if missing." },
+    { "@type": "HowToStep", "name": "Plug in the controller", "text": "Connect the Switch 2 Pro Controller to the PC with a USB-C cable, or choose Bluetooth and hold the SYNC button." },
+    { "@type": "HowToStep", "name": "Press Connect", "text": "Pick your controller model, connection and output type (Xbox 360 or DualShock 4), then press Connect. The app activates the controller automatically." },
+    { "@type": "HowToStep", "name": "Play", "text": "Games and Steam now see a standard Xbox 360 or DS4 gamepad. Test buttons on the live schematic and remap if needed." }
+  ]
+}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0b0d12; --surface:#131720; --surface2:#181d29; --line:#232a38;
+  --text:#e9ecf2; --dim:#8a91a0; --red:#e63b3b; --red-soft:#ff5c5c; --green:#3dc96b;
+  --disp:"Chakra Petch",system-ui,sans-serif;
+  --body:system-ui,"Segoe UI",Roboto,sans-serif;
+  --mono:"JetBrains Mono",Consolas,monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:var(--body);line-height:1.65}
+a{color:inherit;text-decoration:none}
+::selection{background:var(--red);color:#fff}
+.wrap{max-width:860px;margin:0 auto;padding:0 24px}
+nav{position:sticky;top:0;z-index:50;background:rgba(11,13,18,.82);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.nav-in{display:flex;align-items:center;justify-content:space-between;height:64px;max-width:1080px;margin:0 auto;padding:0 24px}
+.logo{font-family:var(--disp);font-weight:700;font-size:1.25rem}
+.logo b{color:var(--red)}
+.nav-links{display:flex;gap:28px;align-items:center;font-size:.92rem;color:var(--dim)}
+.nav-links a:hover{color:var(--text)}
+.btn{display:inline-block;font-family:var(--disp);font-weight:600;background:var(--red);color:#fff;padding:10px 22px;border-radius:8px;transition:transform .15s,background .15s}
+.btn:hover{background:var(--red-soft);transform:translateY(-1px)}
+.btn.small{padding:8px 16px;font-size:.88rem}
+@media(max-width:720px){.nav-links a:not(.btn){display:none}}
+header{padding:64px 0 30px}
+.eyebrow{font-family:var(--mono);font-size:.74rem;letter-spacing:.2em;color:var(--red);text-transform:uppercase;margin-bottom:14px}
+h1{font-family:var(--disp);font-weight:700;font-size:clamp(1.7rem,4vw,2.5rem);line-height:1.15;letter-spacing:-.01em}
+.lead{color:var(--dim);font-size:1.06rem;margin-top:16px;max-width:40rem}
+.toc{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:20px 24px;margin:34px 0 10px}
+.toc b{font-family:var(--disp);font-size:.92rem;display:block;margin-bottom:8px}
+.toc a{display:block;color:var(--dim);padding:4px 0;font-size:.94rem}
+.toc a:hover{color:var(--text)}
+.toc a::before{content:"→ ";color:var(--red)}
+article section{padding:34px 0;border-bottom:1px solid var(--line)}
+article section:last-of-type{border-bottom:none}
+h2{font-family:var(--disp);font-weight:600;font-size:1.45rem;margin-bottom:14px;scroll-margin-top:84px}
+h3{font-family:var(--disp);font-weight:600;font-size:1.05rem;margin:22px 0 8px}
+p,li{color:#c6cbd6;font-size:.97rem}
+article p{margin-bottom:12px;max-width:46rem}
+ol,ul{margin:10px 0 14px 22px}
+li{margin-bottom:8px}
+code{font-family:var(--mono);font-size:.85em;background:var(--surface2);border:1px solid var(--line);border-radius:5px;padding:1px 7px}
+.tip,.warn{border-radius:10px;padding:14px 18px;margin:16px 0;font-size:.92rem;max-width:46rem}
+.tip{background:#12241a;border:1px solid #24513a;color:#a9dcc0}
+.warn{background:#251a12;border:1px solid #5c4023;color:#e8c9a0}
+.shotimg{max-width:100%;border-radius:12px;border:1px solid var(--line);margin:14px 0}
+footer{border-top:1px solid var(--line);padding:36px 0;font-size:.82rem;color:#5b6272;text-align:center}
+footer a{color:#aab1c0}
+footer a:hover{color:var(--text)}
+a:focus-visible,.btn:focus-visible{outline:2px solid var(--red);outline-offset:3px;border-radius:6px}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="nav-in">
+    <a class="logo" href="index.html">connectyour<b>pro</b></a>
+    <div class="nav-links">
+      <a href="index.html#features">Features</a>
+      <a href="index.html#faq">FAQ</a>
+      <a href="https://github.com/KW0j/connectyourpro">GitHub</a>
+      <a class="btn small" href="https://github.com/KW0j/connectyourpro/releases/latest">Download</a>
+    </div>
+  </div>
+</nav>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">Guide</div>
+  <h1>How to connect a Switch 2 Pro Controller to PC</h1>
+  <p class="lead">Everything in one place: USB, Bluetooth, Steam, emulators and fixes for the
+  most common problems — for both the Switch 2 Pro Controller and the original Pro Controller.
+  Total time: about two minutes.</p>
+
+  <div class="toc">
+    <b>On this page</b>
+    <a href="#requirements">What you need</a>
+    <a href="#usb">Switch 2 Pro Controller over USB (recommended)</a>
+    <a href="#bluetooth">Switch 2 Pro Controller over Bluetooth</a>
+    <a href="#procon1">Original Pro Controller (Switch 1)</a>
+    <a href="#steam">Using it with Steam</a>
+    <a href="#emulators">Gyro in emulators (Dolphin, Cemu)</a>
+    <a href="#troubleshooting">Troubleshooting</a>
+  </div>
+</header>
+
+<article>
+<section id="requirements">
+  <h2>What you need</h2>
+  <ul>
+    <li>A Windows 10 or 11 PC</li>
+    <li>A Nintendo Switch 2 Pro Controller (or the original Switch Pro Controller)</li>
+    <li>A USB-C cable (for the wired setup) or Bluetooth on the PC</li>
+    <li><a href="https://github.com/KW0j/connectyourpro/releases/latest"><strong>connectyourpro</strong></a> —
+        free and open source. The installer also sets up the
+        <a href="https://github.com/nefarius/ViGEmBus">ViGEmBus</a> driver if you don't have it;
+        that's the component that lets Windows host virtual gamepads.</li>
+  </ul>
+  <p><strong>Why is a tool needed at all?</strong> On the console, the Switch 2 Pro Controller
+  receives a proprietary activation sequence before it starts sending input. A PC never sends it,
+  so out of the box the controller does nothing on Windows. connectyourpro replays that sequence
+  and then presents the controller to your games as a standard Xbox 360 (XInput) or DualShock 4 pad.</p>
+</section>
+
+<section id="usb">
+  <h2>Switch 2 Pro Controller over USB (recommended)</h2>
+  <ol>
+    <li>Install and launch <strong>connectyourpro</strong>.</li>
+    <li>Plug the controller into the PC with a USB-C cable.</li>
+    <li>In the app pick <strong>Pro Controller 2</strong> → <strong>USB</strong> →
+        <strong>Xbox 360 (XInput)</strong> (best compatibility) or <strong>DualShock 4</strong>.</li>
+    <li>Press <strong>Connect</strong>. Activation runs automatically — after a second or two the
+        dashboard appears.</li>
+    <li>Press a few buttons: they light up on the controller schematic. You're done — start your game.</li>
+  </ol>
+  <img class="shotimg" src="shots/setup.jpg" alt="connectyourpro setup screen: choosing Pro Controller 2, USB connection and Xbox 360 output" loading="lazy">
+  <div class="tip">USB gives the lowest input lag — the controller reports every 4 ms. If you play
+  anything fast-paced, use the cable.</div>
+</section>
+
+<section id="bluetooth">
+  <h2>Switch 2 Pro Controller over Bluetooth</h2>
+  <p>Bluetooth on the ProCon 2 is <strong>experimental</strong>: expect noticeably more input lag
+  than USB, because the controller talks Bluetooth LE and Windows' BLE stack adds delay.</p>
+  <ol>
+    <li><strong>Do not pair the controller in Windows Bluetooth settings.</strong> If it's already
+        paired there, remove it first — Windows will otherwise grab the connection for itself.</li>
+    <li>In the app pick <strong>Pro Controller 2</strong> → <strong>Bluetooth</strong> and press
+        <strong>Connect</strong>.</li>
+    <li>Hold the controller's <strong>SYNC button</strong> (the small round button next to the USB-C
+        port) until the player LEDs start sweeping back and forth.</li>
+    <li>The app finds the controller by itself within a few seconds and activates it.</li>
+  </ol>
+  <div class="warn">Nintendo's controllers have a connection cooldown: several connect attempts in a
+  short time and the pad goes silent for a few minutes. If scanning stops finding it, put it down,
+  wait, try again.</div>
+</section>
+
+<section id="procon1">
+  <h2>Original Pro Controller (Switch 1)</h2>
+  <h3>USB</h3>
+  <ol>
+    <li>Plug the controller in with a USB-C cable.</li>
+    <li>Pick <strong>Pro Controller 1</strong> → <strong>USB</strong> → output type → <strong>Connect</strong>.</li>
+  </ol>
+  <h3>Bluetooth</h3>
+  <ol>
+    <li>Pair the controller in <strong>Windows Settings → Bluetooth &amp; devices</strong> first
+        (hold the SYNC button on the controller until the LEDs sweep, then add "Pro Controller").</li>
+    <li>In the app pick <strong>Pro Controller 1</strong> → <strong>Bluetooth</strong> → <strong>Connect</strong>.</li>
+  </ol>
+  <p>The Switch 1 pad uses classic Bluetooth (not BLE), which is why Windows pairing is needed here
+  but not for the ProCon 2 — the two controllers speak entirely different protocols.</p>
+</section>
+
+<section id="steam">
+  <h2>Using it with Steam</h2>
+  <p>Nothing special to configure: once connected, Steam sees a regular
+  <strong>Xbox 360 Controller</strong> (or DualShock 4, if you chose that output) and every Steam
+  Input feature works as usual.</p>
+  <div class="tip">If a game shows double input (reacts twice to one press), it's reading both the
+  physical pad and the virtual one. In Steam, disable Steam Input for the "Pro Controller" device,
+  or ignore the physical pad in the game's controller settings.</div>
+</section>
+
+<section id="emulators">
+  <h2>Gyro in emulators (Dolphin, Cemu)</h2>
+  <ol>
+    <li>Connect the controller in connectyourpro (Bluetooth mode carries motion data).</li>
+    <li>On the dashboard enable <strong>DSU server (gyro for emulators)</strong>.</li>
+    <li>In the emulator, add a DSU / Cemuhook motion source pointing at
+        <code>127.0.0.1</code> port <code>26760</code>:
+        <ul>
+          <li><strong>Dolphin</strong>: Controllers → Alternate Input Sources → enable, address as above.</li>
+          <li><strong>Cemu</strong>: Input settings → add DSU controller as motion source.</li>
+        </ul></li>
+  </ol>
+</section>
+
+<section id="troubleshooting">
+  <h2>Troubleshooting</h2>
+  <h3>The "Pro Controller" in Windows' game controller panel flashes randomly</h3>
+  <p>Expected. That entry is the <em>physical</em> controller, which after activation speaks a
+  protocol Windows can't parse. Games use the virtual <strong>Xbox 360 Controller</strong> — test
+  that one (or use the live schematic right in the app).</p>
+
+  <h3>No input after pressing Connect (USB)</h3>
+  <ol>
+    <li>Unplug the USB cable, plug it back in, press <strong>Connect</strong> again.</li>
+    <li>Try a different USB port and a data-capable cable (some charge-only cables won't work).</li>
+    <li>Close other tools that may hold the controller open (Steam with the pad configured, a
+        procon2tool browser tab).</li>
+  </ol>
+
+  <h3>Bluetooth scan never finds the ProCon 2</h3>
+  <ol>
+    <li>Remove the controller from Windows' Bluetooth device list if it's there.</li>
+    <li>Hold SYNC until the LEDs sweep <em>while</em> the app is scanning.</li>
+    <li>Hit the cooldown? Wait a few minutes — the controller locks up after repeated attempts.</li>
+  </ol>
+
+  <h3>Buttons feel wrong (A/B swapped)</h3>
+  <p>That's the Nintendo vs Xbox layout difference. On the dashboard press
+  <strong>Swap A&lt;-&gt;B, X&lt;-&gt;Y (Nintendo layout)</strong>, or click any button on the
+  schematic and remap it individually.</p>
+
+  <h3>It worked yesterday, today nothing</h3>
+  <p>Unplug and replug the controller, then Connect again. If Bluetooth: remove and re-add. The
+  controller occasionally needs a fresh activation after sleeping.</p>
+</section>
+</article>
+
+<div style="text-align:center;padding:44px 0 56px">
+  <a class="btn" href="https://github.com/KW0j/connectyourpro/releases/latest">Download connectyourpro — free</a>
+</div>
+</div>
+
+<footer>
+  <div class="wrap">
+    <a href="index.html">connectyourpro</a> · <a href="https://github.com/KW0j/connectyourpro">GitHub</a> ·
+    MIT License · Not affiliated with Nintendo. Nintendo Switch and Pro Controller are trademarks of Nintendo.
+  </div>
+</footer>
+
+</body>
+</html>
