@@ -82,7 +82,7 @@ Yes — Steam sees the virtual Xbox 360 / DS4 pad like any other controller.
 
 ## Credits
 
-- Based on [joycon2cpp](https://github.com/TheFrano/joycon2cpp) by **Frano (TheFrano)** —
+- Based on [joycon2cpp](https://github.com/TheFrano/joycon2cpp) by **TheFrano** —
   the original Switch 2 BLE research and implementation this project grew from. many thanks, amazing work!!
 - [procon2tool](https://handheldlegend.github.io/procon2tool/) by **HandheldLegend** —
   the USB activation sequence.
