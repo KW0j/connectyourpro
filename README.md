@@ -4,7 +4,7 @@
 
 **Use your Nintendo Switch Pro Controller (1 & 2) on PC — no browser tricks, no hassle.**
 
-[Download](https://github.com/KW0jtowicz/connectyourpro/releases/latest) · [Website](https://connectyour.pro) · [FAQ](#faq)
+[Download](https://github.com/KW0j/connectyourpro/releases/latest) · [Website](https://connectyour.pro) · [FAQ](#faq)
 
 </div>
 
@@ -30,7 +30,7 @@ Xbox 360 (XInput) or DualShock 4 gamepad that every PC game understands.
 ## Installation
 
 1. Grab **connectyourpro-setup** from the
-   [latest release](https://github.com/KW0jtowicz/connectyourpro/releases/latest).
+   [latest release](https://github.com/KW0j/connectyourpro/releases/latest).
 2. Run it — the installer also sets up the [ViGEmBus](https://github.com/nefarius/ViGEmBus)
    driver (required for virtual gamepads) if it's not present.
 3. Launch connectyourpro, pick your controller, connection and output type, hit **Connect**.

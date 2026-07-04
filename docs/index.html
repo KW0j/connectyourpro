@@ -3,8 +3,62 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>connectyourpro — Switch Pro Controller on PC</title>
+<title>Connect your Switch 2 Pro Controller to PC — connectyourpro (free tool)</title>
 <meta name="description" content="Free, open-source Windows tool that makes the Nintendo Switch 2 Pro Controller (and the original Pro Controller) work on PC as an Xbox 360 or DualShock 4 pad. One click, no browser tricks.">
+<link rel="canonical" href="https://connectyour.pro/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="connectyourpro">
+<meta property="og:title" content="Connect your Switch 2 Pro Controller to PC — free tool">
+<meta property="og:description" content="The Switch 2 Pro Controller does nothing when plugged into a PC. connectyourpro activates it and turns it into an Xbox 360 / DualShock 4 pad every game understands. Free & open source.">
+<meta property="og:url" content="https://connectyour.pro/">
+<meta property="og:image" content="https://connectyour.pro/shots/dashboard.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Connect your Switch 2 Pro Controller to PC — free tool">
+<meta name="twitter:description" content="Built-in activation, XInput/DS4 output, live test view, remapping, gyro. Free & open source.">
+<meta name="twitter:image" content="https://connectyour.pro/shots/dashboard.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "name": "connectyourpro",
+      "operatingSystem": "Windows 10, Windows 11",
+      "applicationCategory": "UtilitiesApplication",
+      "description": "Free, open-source Windows tool that makes the Nintendo Switch 2 Pro Controller and the original Pro Controller work on PC as an Xbox 360 (XInput) or DualShock 4 gamepad.",
+      "url": "https://connectyour.pro/",
+      "downloadUrl": "https://github.com/KW0j/connectyourpro/releases/latest",
+      "license": "https://github.com/KW0j/connectyourpro/blob/main/LICENSE",
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
+    },
+    {
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "How do I connect a Switch 2 Pro Controller to my PC?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Install connectyourpro, plug the controller in over USB (or use Bluetooth), pick the output type and press Connect. The app sends the activation sequence the controller needs and your games see a regular Xbox 360 or DualShock 4 pad." }
+        },
+        {
+          "@type": "Question",
+          "name": "Why doesn't the Switch 2 Pro Controller work on PC out of the box?",
+          "acceptedAnswer": { "@type": "Answer", "text": "The controller waits for a proprietary activation sequence that only the Nintendo Switch 2 console normally sends. Windows never sends it, so the pad stays silent. connectyourpro replays that sequence automatically." }
+        },
+        {
+          "@type": "Question",
+          "name": "Does it work with Steam and games like Forza?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Yes. The controller shows up as a virtual Xbox 360 (XInput) or DualShock 4 pad, which practically every PC game and Steam support natively." }
+        },
+        {
+          "@type": "Question",
+          "name": "Is connectyourpro free and safe?",
+          "acceptedAnswer": { "@type": "Answer", "text": "It is free and fully open source under the MIT license. The bundled ViGEmBus driver is the same signed driver used by DS4Windows and similar tools." }
+        }
+      ]
+    }
+  ]
+}
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -154,8 +208,8 @@ a:focus-visible,summary:focus-visible,.btn:focus-visible{outline:2px solid var(-
       <a href="#features">Features</a>
       <a href="#how">How it works</a>
       <a href="#faq">FAQ</a>
-      <a href="https://github.com/KW0jtowicz/connectyourpro">GitHub</a>
-      <a class="btn small" href="https://github.com/KW0jtowicz/connectyourpro/releases/latest">Download</a>
+      <a href="https://github.com/KW0j/connectyourpro">GitHub</a>
+      <a class="btn small" href="https://github.com/KW0j/connectyourpro/releases/latest">Download</a>
     </div>
   </div>
 </nav>
@@ -169,8 +223,8 @@ a:focus-visible,summary:focus-visible,.btn:focus-visible{outline:2px solid var(-
         it waits for a secret handshake only the console sends. connectyourpro sends it for you
         and turns the pad into an Xbox 360 or DualShock 4 controller every game understands.</p>
         <div class="cta-row">
-          <a class="btn" href="https://github.com/KW0jtowicz/connectyourpro/releases/latest">Download for Windows</a>
-          <a class="btn ghost" href="https://github.com/KW0jtowicz/connectyourpro">View source</a>
+          <a class="btn" href="https://github.com/KW0j/connectyourpro/releases/latest">Download for Windows</a>
+          <a class="btn ghost" href="https://github.com/KW0j/connectyourpro">View source</a>
         </div>
         <div class="meta">
           <span><i>●</i> Free &amp; open source</span>
@@ -299,8 +353,14 @@ a:focus-visible,summary:focus-visible,.btn:focus-visible{outline:2px solid var(-
     <div class="eyebrow rv">Screenshots</div>
     <h2 class="rv">Clean by design</h2>
     <div class="shots">
-      <div class="shot rv"><div class="ph"><span>[ screenshot ]</span><span>setup — controller &amp; output picker</span></div></div>
-      <div class="shot rv"><div class="ph"><span>[ screenshot ]</span><span>dashboard — live test view &amp; remap</span></div></div>
+      <div class="shot rv">
+        <img src="shots/setup.png" alt="connectyourpro setup screen — pick Pro Controller 2 or 1, USB or Bluetooth, XInput or DualShock 4 output"
+             onerror="this.outerHTML='&lt;div class=&quot;ph&quot;&gt;&lt;span&gt;[ screenshot ]&lt;/span&gt;&lt;span&gt;setup — controller &amp;amp; output picker&lt;/span&gt;&lt;/div&gt;'">
+      </div>
+      <div class="shot rv">
+        <img src="shots/dashboard.png" alt="connectyourpro dashboard — live controller test view with button remapping on a pad schematic"
+             onerror="this.outerHTML='&lt;div class=&quot;ph&quot;&gt;&lt;span&gt;[ screenshot ]&lt;/span&gt;&lt;span&gt;dashboard — live test view &amp;amp; remap&lt;/span&gt;&lt;/div&gt;'">
+      </div>
     </div>
   </div>
 </section>
@@ -310,6 +370,13 @@ a:focus-visible,summary:focus-visible,.btn:focus-visible{outline:2px solid var(-
     <div class="eyebrow rv">FAQ</div>
     <h2 class="rv">Before you ask</h2>
     <div class="faq rv" style="margin-top:10px">
+      <details>
+        <summary>How do I connect a Switch 2 Pro Controller to my PC?</summary>
+        <div class="a">Install connectyourpro, plug the controller in over USB (or pick Bluetooth),
+        choose Xbox 360 or DualShock 4 output and press <strong>Connect</strong>. The app sends the
+        activation sequence the controller is waiting for, and from that moment your games see a
+        regular gamepad. No browser tools, no Steam requirement, no manual driver fiddling.</div>
+      </details>
       <details>
         <summary>Windows' game controller panel shows my Pro Controller flashing randomly.</summary>
         <div class="a">That entry is the <em>physical</em> controller. After activation it speaks a
@@ -352,7 +419,7 @@ a:focus-visible,summary:focus-visible,.btn:focus-visible{outline:2px solid var(-
 <section class="band">
   <div class="wrap rv">
     <h2>Plug it in. Press Connect. Play.</h2>
-    <a class="btn" href="https://github.com/KW0jtowicz/connectyourpro/releases/latest" style="margin-top:18px">Download connectyourpro</a>
+    <a class="btn" href="https://github.com/KW0j/connectyourpro/releases/latest" style="margin-top:18px">Download connectyourpro</a>
     <div class="note">Free forever · MIT licensed · If it saved your evening, a donation is always appreciated</div>
   </div>
 </section>
@@ -368,9 +435,9 @@ a:focus-visible,summary:focus-visible,.btn:focus-visible{outline:2px solid var(-
       <div>
         <h4>Credits &amp; links</h4>
         <p>
-          <a href="https://github.com/KW0jtowicz/connectyourpro">Source code</a> ·
-          <a href="https://github.com/KW0jtowicz/connectyourpro/releases/latest">Releases</a><br>
-          Fork of <a href="https://github.com/TheFrano/joycon2cpp">joycon2cpp</a> by TheFrano ·
+          <a href="https://github.com/KW0j/connectyourpro">Source code</a> ·
+          <a href="https://github.com/KW0j/connectyourpro/releases/latest">Releases</a><br>
+          Based on <a href="https://github.com/TheFrano/joycon2cpp">joycon2cpp</a> by TheFrano ·
           Activation research by <a href="https://handheldlegend.github.io/procon2tool/">HandheldLegend</a>
           and <a href="https://github.com/german77">german77</a><br>
           <a href="https://github.com/nefarius/ViGEmBus">ViGEmBus</a> by Nefarius ·
