@@ -24,8 +24,9 @@ include_directories(
   ${IMGUI_DIR}/backends
 )
 
+# Final version — built-in procon2tool init (WinUSB vendor interface)
 set(TESTAPP_SOURCES
-  src/testapp.cpp
+  src/testapp_final.cpp
   src/JoyConDecoder.cpp
   src/DsuServer.cpp
   ${IMGUI_SOURCES}
@@ -33,16 +34,48 @@ set(TESTAPP_SOURCES
 
 add_executable(testapp WIN32 ${TESTAPP_SOURCES})
 
+# Previous experimental version (src/testapp.cpp), preserved as a separate executable
+add_executable(testapp_old WIN32
+  src/testapp.cpp
+  src/JoyConDecoder.cpp
+  src/DsuServer.cpp
+  ${IMGUI_SOURCES}
+)
+
 
 add_executable(dsu_pointer_tester WIN32
   src/dsu_pointer_tester.cpp
 )
+
+add_executable(probe
+  src/probe.cpp
+)
+target_link_directories(probe PRIVATE ${CMAKE_SOURCE_DIR}/lib)
+target_link_libraries(probe PRIVATE setupapi hid winmm user32)
+if(MSVC)
+  target_compile_options(probe PRIVATE /W3)
+endif()
 
 target_link_directories(testapp PRIVATE ${CMAKE_SOURCE_DIR}/lib)
 target_link_libraries(testapp
     PRIVATE
         setupapi
         hid
+        winusb
+        shell32
+        ViGEmClient
+        windowsapp
+        ws2_32
+        d3d11
+        dxgi
+        d3dcompiler
+)
+target_link_directories(testapp_old PRIVATE ${CMAKE_SOURCE_DIR}/lib)
+target_link_libraries(testapp_old
+    PRIVATE
+        setupapi
+        hid
+        winusb
         ViGEmClient
         windowsapp
         ws2_32

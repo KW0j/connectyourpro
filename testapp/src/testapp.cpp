@@ -1,240 +1,447 @@
 #define NOMINMAX
-
-#include <winrt/Windows.Foundation.h>
-#include <winrt/Windows.Foundation.Collections.h>
-#include <winrt/Windows.Storage.Streams.h>
-#include <winrt/Windows.Devices.Bluetooth.h>
-#include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
-#include <winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h>
-
+#include <Windows.h>
+extern "C" {
+#include <hidsdi.h>
+#include <hidpi.h>
+}
+#include <winusb.h>
+#include <setupapi.h>
 #include <d3d11.h>
 #include <dxgi.h>
-#include <tchar.h>
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 
-#include <iostream>
-#include <vector>
 #include <algorithm>
-#include <thread>
-#include <mutex>
 #include <atomic>
-#include <condition_variable>
-#include <memory>
-#include <fstream>
-#include <sstream>
-#include <map>
 #include <chrono>
 #include <iomanip>
+#include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
-#include <functional>
+#include <thread>
+#include <vector>
 
 #include "JoyConDecoder.h"
 #include "DsuServer.h"
-#include <Windows.h>
 #include <ViGEm/Client.h>
 #include <ViGEm/Common.h>
 
-using namespace winrt;
-using namespace Windows::Devices::Bluetooth;
-using namespace Windows::Devices::Bluetooth::Advertisement;
-using namespace Windows::Devices::Bluetooth::GenericAttributeProfile;
-using namespace Windows::Storage::Streams;
-using namespace Windows::Foundation;
-
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-constexpr uint16_t JOYCON_MANUFACTURER_ID = 1363;
-const std::vector<uint8_t> JOYCON_MANUFACTURER_PREFIX = { 0x01, 0x00, 0x03, 0x7E };
-const wchar_t* INPUT_REPORT_UUID  = L"ab7de9be-89fe-49ad-828f-118f09df7fd2";
-const wchar_t* WRITE_COMMAND_UUID = L"649d4ac9-8eb7-4e6c-af44-1ea54fe5f005";
-const std::string CONFIG_FILE = "joycon2cpp_config.json";
+// ─── Constants ───────────────────────────────────────────────────────────────
 
+constexpr USHORT  SWITCH_VID        = 0x057E;
+constexpr USHORT  PRO_CTRL_PID      = 0x2069;
+
+// Nintendo USB command IDs (Report ID 0x80)
+constexpr uint8_t USB_CMD_HANDSHAKE    = 0x02;
+constexpr uint8_t USB_CMD_HID_ENABLE   = 0x03;
+constexpr uint8_t USB_CMD_KEEPALIVE_OFF= 0x04;
+
+// Subcommand IDs (sent via Report ID 0x01)
+constexpr uint8_t SUBCMD_SET_INPUT_MODE = 0x03;
+constexpr uint8_t SUBCMD_ENABLE_IMU     = 0x40;
+constexpr uint8_t INPUT_MODE_FULL       = 0x30;
+
+// ─── App state ───────────────────────────────────────────────────────────────
+
+enum class AppScreen    { Setup, Connecting, Running };
 enum class UpdatePolicy { LowLatency, Balanced120Hz, Legacy60Hz };
-enum ControllerType { SingleJoyCon = 1, DualJoyCon = 2, ProController = 3, NSOGCController = 4 };
 
-enum class ButtonMapping {
-    NONE, L3, R3, L1, R1, L2, R2,
-    CROSS, CIRCLE, SQUARE, TRIANGLE,
-    SHARE, OPTIONS,
-    DPAD_UP, DPAD_DOWN, DPAD_LEFT, DPAD_RIGHT
-};
+static AppScreen    g_screen       = AppScreen::Setup;
+static UpdatePolicy g_updatePolicy = UpdatePolicy::LowLatency;
+static bool         g_dsuEnabled   = false;
 
-enum class AppScreen { Setup, Connecting, Running };
+static PVIGEM_CLIENT g_vigem     = nullptr;
+static PVIGEM_TARGET g_ds4       = nullptr;
+static DsuServer     g_dsuServer;
 
-struct GLGRLayout {
-    char name[64] = "Layout 1";
-    ButtonMapping glMapping = ButtonMapping::NONE;
-    ButtonMapping grMapping = ButtonMapping::NONE;
-};
+static HANDLE            g_hidDevice  = INVALID_HANDLE_VALUE;
+static std::atomic<bool> g_running   {false};
+static std::thread       g_readThread;
+static std::string       g_connectError;
+static std::string       g_statusMsg = "Ready.";
 
-struct ProControllerConfig {
-    std::vector<GLGRLayout> layouts;
-    int activeLayoutIndex = 0;
-};
+// ─── WinUSB globals ───────────────────────────────────────────────────────────
+// {88BAE032-5A81-49F0-BC3D-A4FF138216D6} — GUID Zadig assigns when installing WinUSB
+static const GUID ZADIG_WINUSB_GUID =
+    {0x88BAE032, 0x5A81, 0x49F0, {0xBC, 0x3D, 0xA4, 0xFF, 0x13, 0x82, 0x16, 0xD6}};
 
-struct RuntimeOptions {
-    bool latencyMetrics = false;
-    UpdatePolicy updatePolicy = UpdatePolicy::LowLatency;
-    char latencyCsvPath[256] = "latency_benchmark.csv";
-};
+static bool                    g_useWinUSB    = false;
+static WINUSB_INTERFACE_HANDLE g_winusbHandle = nullptr;
+static BYTE                    g_pipeIn       = 0;
+static BYTE                    g_pipeOut      = 0;
 
-struct PlayerConfig {
-    ControllerType controllerType = SingleJoyCon;
-    JoyConSide     joyconSide        = JoyConSide::Left;
-    JoyConOrientation joyconOrientation = JoyConOrientation::Upright;
-    GyroSource     gyroSource        = GyroSource::Both;
-    GyroMode       gyroMode          = GyroMode::DS4Raw;
-    MotionProfile  motionProfile     = MotionProfile::Raw;
-};
+// ─── Logging ─────────────────────────────────────────────────────────────────
 
-struct ConnectedJoyCon {
-    BluetoothLEDevice      device    = nullptr;
-    GattCharacteristic     inputChar = nullptr;
-    GattCharacteristic     writeChar = nullptr;
-};
+static std::mutex              g_logMutex;
+static std::vector<std::string> g_logLines;
+
+static void AppLog(const std::string& s) {
+    printf("[LOG] %s\n", s.c_str());
+    fflush(stdout);
+    OutputDebugStringA(("[SW2Pro] " + s + "\n").c_str());
+    std::lock_guard<std::mutex> lk(g_logMutex);
+    g_logLines.push_back(s);
+    if (g_logLines.size() > 300) g_logLines.erase(g_logLines.begin());
+}
+
+// ─── WinUSB helpers ──────────────────────────────────────────────────────────
+
+// Parse "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}" GUID string (no ole32 needed)
+static bool ParseGUIDStr(const WCHAR* s, GUID& g) {
+    unsigned a,b,c, d[8];
+    if (swscanf_s(s, L"{%8X-%4X-%4X-%2X%2X-%2X%2X%2X%2X%2X%2X}",
+                  &a,&b,&c,&d[0],&d[1],&d[2],&d[3],&d[4],&d[5],&d[6],&d[7]) != 11)
+        return false;
+    g.Data1=a; g.Data2=(USHORT)b; g.Data3=(USHORT)c;
+    for(int i=0;i<8;i++) g.Data4[i]=(BYTE)d[i];
+    return true;
+}
+
+// Open the WinUSB interface for our device.
+// Zadig 2.9+ writes a unique DeviceInterfaceGUIDs value per device into the
+// device's registry "Device Parameters" key.  We read it dynamically instead
+// of relying on a hard-coded GUID.
+static HANDLE FindProControllerWinUSB() {
+    // Enumerate devices in the WinUSB/libusb device class
+    HDEVINFO di = SetupDiGetClassDevs(&ZADIG_WINUSB_GUID, nullptr, nullptr, DIGCF_PRESENT);
+    if (di == INVALID_HANDLE_VALUE) {
+        AppLog("[WINUSB] SetupDiGetClassDevs failed");
+        return INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE result = INVALID_HANDLE_VALUE;
+    SP_DEVINFO_DATA dd = {}; dd.cbSize = sizeof(dd);
+
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(di, i, &dd) && result == INVALID_HANDLE_VALUE; i++) {
+        char instId[512] = {};
+        if (!SetupDiGetDeviceInstanceIdA(di, &dd, instId, sizeof(instId), nullptr)) continue;
+
+        char upper[512]; strncpy_s(upper, instId, 511);
+        for (char* p = upper; *p; p++) *p = (char)toupper((unsigned char)*p);
+        AppLog("[WINUSB] Class device: " + std::string(instId));
+
+        if (!strstr(upper, "VID_057E") || !strstr(upper, "PID_2069")) continue;
+        AppLog("[WINUSB] VID/PID matched: " + std::string(instId));
+
+        // Read DeviceInterfaceGUIDs (Zadig 2.9+) or DeviceInterfaceGUID from registry
+        HKEY regKey = SetupDiOpenDevRegKey(di, &dd, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
+        if (regKey == INVALID_HANDLE_VALUE) { AppLog("[WINUSB] Can't open regkey"); continue; }
+
+        WCHAR guidBuf[256] = {};
+        DWORD type = 0, sz = sizeof(guidBuf);
+        LSTATUS ls = RegQueryValueExW(regKey, L"DeviceInterfaceGUIDs", nullptr, &type, (LPBYTE)guidBuf, &sz);
+        if (ls != ERROR_SUCCESS) {
+            sz = sizeof(guidBuf);
+            ls = RegQueryValueExW(regKey, L"DeviceInterfaceGUID", nullptr, &type, (LPBYTE)guidBuf, &sz);
+        }
+        RegCloseKey(regKey);
+
+        if (ls != ERROR_SUCCESS) { AppLog("[WINUSB] No DeviceInterfaceGUID in registry"); continue; }
+
+        char guidA[64] = {};
+        WideCharToMultiByte(CP_UTF8, 0, guidBuf, -1, guidA, 64, nullptr, nullptr);
+        AppLog("[WINUSB] DeviceInterfaceGUID = " + std::string(guidA));
+
+        GUID ifGuid;
+        if (!ParseGUIDStr(guidBuf, ifGuid)) { AppLog("[WINUSB] GUID parse failed"); continue; }
+
+        // Enumerate device interfaces with this GUID and find our VID/PID
+        HDEVINFO di2 = SetupDiGetClassDevs(&ifGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (di2 == INVALID_HANDLE_VALUE) continue;
+
+        SP_DEVICE_INTERFACE_DATA ifd = {}; ifd.cbSize = sizeof(ifd);
+        for (DWORD j = 0; SetupDiEnumDeviceInterfaces(di2, nullptr, &ifGuid, j, &ifd) && result == INVALID_HANDLE_VALUE; j++) {
+            DWORD need = 0;
+            SetupDiGetDeviceInterfaceDetail(di2, &ifd, nullptr, 0, &need, nullptr);
+            if (!need) continue;
+            auto* det = (PSP_DEVICE_INTERFACE_DETAIL_DATA)malloc(need);
+            det->cbSize = sizeof(*det);
+            if (SetupDiGetDeviceInterfaceDetail(di2, &ifd, det, need, nullptr, nullptr)) {
+                // DevicePath is already ANSI in non-Unicode build — use directly
+                std::string p(det->DevicePath);
+                for (auto& c : p) c = (char)toupper((unsigned char)c);
+                AppLog("[WINUSB] Interface path: " + p.substr(0, 80));
+                if (p.find("VID_057E") != std::string::npos && p.find("PID_2069") != std::string::npos && p.find("MI_00") != std::string::npos) {
+                    HANDLE h = CreateFile(det->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                                           0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+                    if (h != INVALID_HANDLE_VALUE) {
+                        AppLog("[WINUSB] Opened exclusively!");
+                        result = h;
+                    } else {
+                        AppLog("[WINUSB] CreateFile failed: " + std::to_string(GetLastError()));
+                    }
+                }
+            }
+            free(det);
+        }
+        SetupDiDestroyDeviceInfoList(di2);
+    }
+    SetupDiDestroyDeviceInfoList(di);
+    return result;
+}
+
+// Initialize WinUSB handle and discover IN/OUT interrupt pipes.
+static bool InitWinUSBIface(HANDLE hDev) {
+    if (!WinUsb_Initialize(hDev, &g_winusbHandle)) {
+        AppLog("[WINUSB] WinUsb_Initialize failed: " + std::to_string(GetLastError()));
+        return false;
+    }
+    USB_INTERFACE_DESCRIPTOR ifDesc = {};
+    WinUsb_QueryInterfaceSettings(g_winusbHandle, 0, &ifDesc);
+    AppLog("[WINUSB] Interface: " + std::to_string(ifDesc.bNumEndpoints) + " endpoints");
+
+    g_pipeIn = 0; g_pipeOut = 0;
+    for (BYTE e = 0; e < ifDesc.bNumEndpoints; e++) {
+        WINUSB_PIPE_INFORMATION pipe = {};
+        WinUsb_QueryPipe(g_winusbHandle, 0, e, &pipe);
+        std::ostringstream oss;
+        oss << "[WINUSB]   Pipe 0x" << std::hex << (int)pipe.PipeId
+            << " type=" << (int)pipe.PipeType << " maxPkt=" << pipe.MaximumPacketSize;
+        AppLog(oss.str());
+        if (pipe.PipeType == UsbdPipeTypeInterrupt || pipe.PipeType == UsbdPipeTypeBulk) {
+            if (pipe.PipeId & 0x80) g_pipeIn  = pipe.PipeId;
+            else                    g_pipeOut = pipe.PipeId;
+        }
+    }
+    if (!g_pipeIn || !g_pipeOut) {
+        AppLog("[WINUSB] Could not find IN/OUT pipes!");
+        return false;
+    }
+    AppLog("[WINUSB] PipeIn=0x" + [&]{ std::ostringstream o; o<<std::hex<<(int)g_pipeIn; return o.str(); }()
+         + " PipeOut=0x" + [&]{ std::ostringstream o; o<<std::hex<<(int)g_pipeOut; return o.str(); }());
+    return true;
+}
+
+// Write one packet to the OUT pipe synchronously (used during init).
+static void WinUSBSendPkt(const uint8_t* data, size_t len) {
+    std::vector<uint8_t> buf(64, 0);
+    memcpy(buf.data(), data, std::min(len, (size_t)64));
+    ULONG written = 0;
+    if (!WinUsb_WritePipe(g_winusbHandle, g_pipeOut, buf.data(), 64, &written, nullptr))
+        AppLog("[WINUSB] WritePipe failed: " + std::to_string(GetLastError()));
+}
+
+// Nintendo Switch 2 Pro Controller USB init sequence (from procon2-driver/controller.go)
+// followed by subcommands to activate full 0x30 input reports + IMU.
+static void InitProControllerWinUSB() {
+    // 17-packet init sequence
+    static const std::vector<std::vector<uint8_t>> INIT_SEQ = {
+        {0x03,0x91,0x00,0x0d,0x00,0x08,0x00,0x00,0x01,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF},
+        {0x07,0x91,0x00,0x01,0x00,0x00,0x00,0x00},
+        {0x16,0x91,0x00,0x01,0x00,0x00,0x00,0x00},
+        {0x15,0x91,0x00,0x01,0x00,0x0e,0x00,0x00,0x00,0x02,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF},
+        {0x15,0x91,0x00,0x02,0x00,0x11,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF},
+        {0x15,0x91,0x00,0x03,0x00,0x01,0x00,0x00,0x00},
+        {0x09,0x91,0x00,0x07,0x00,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+        {0x0c,0x91,0x00,0x02,0x00,0x04,0x00,0x00,0x27,0x00,0x00,0x00},
+        {0x11,0x91,0x00,0x03,0x00,0x00,0x00,0x00},
+        {0x0a,0x91,0x00,0x08,0x00,0x14,0x00,0x00,0x01,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x35,0x00,0x46,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+        {0x0c,0x91,0x00,0x04,0x00,0x04,0x00,0x00,0x27,0x00,0x00,0x00},
+        {0x03,0x91,0x00,0x0a,0x00,0x04,0x00,0x00,0x09,0x00,0x00,0x00},
+        {0x10,0x91,0x00,0x01,0x00,0x00,0x00,0x00},
+        {0x01,0x91,0x00,0x0c,0x00,0x00,0x00,0x00},
+        {0x03,0x91,0x00,0x01,0x00,0x00,0x00},
+        {0x0a,0x91,0x00,0x02,0x00,0x04,0x00,0x00,0x03,0x00,0x00},
+        {0x09,0x91,0x00,0x07,0x00,0x08,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    };
+
+    AppLog("[WINUSB] Sending 17-packet init sequence...");
+    for (size_t i = 0; i < INIT_SEQ.size(); i++) {
+        WinUSBSendPkt(INIT_SEQ[i].data(), INIT_SEQ[i].size());
+        Sleep(15);
+    }
+
+    // Standard subcommands: set input report mode to 0x30 + enable IMU
+    static uint8_t subcmdCtr = 0;
+    AppLog("[WINUSB] Setting input mode 0x30...");
+    uint8_t modeCmd[] = {0x01, subcmdCtr++, 0x00,0x01,0x40,0x40,0x00,0x01,0x40,0x40, 0x03, 0x30};
+    WinUSBSendPkt(modeCmd, sizeof(modeCmd));
+    Sleep(100);
+
+    AppLog("[WINUSB] Enabling IMU...");
+    uint8_t imuCmd[] = {0x01, subcmdCtr++, 0x00,0x01,0x40,0x40,0x00,0x01,0x40,0x40, 0x40, 0x01};
+    WinUSBSendPkt(imuCmd, sizeof(imuCmd));
+    Sleep(100);
+
+    AppLog("[WINUSB] Init complete — controller should now send 0x30 reports");
+}
+
+// ─── USB HID helpers ─────────────────────────────────────────────────────────
+
+// Queried from HID descriptor at open time
+static USHORT g_hidInputReportLen  = 64;
+static USHORT g_hidOutputReportLen = 64;
+
+static HANDLE FindProController() {
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+
+    HDEVINFO devInfo = SetupDiGetClassDevs(&hidGuid, nullptr, nullptr,
+                                            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (devInfo == INVALID_HANDLE_VALUE) {
+        AppLog("[USB] SetupDiGetClassDevs failed, error=" + std::to_string(GetLastError()));
+        return INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE found = INVALID_HANDLE_VALUE;
+    SP_DEVICE_INTERFACE_DATA ifData = {};
+    ifData.cbSize = sizeof(ifData);
+
+    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(devInfo, nullptr, &hidGuid, i, &ifData); i++) {
+        DWORD needed = 0;
+        SetupDiGetDeviceInterfaceDetail(devInfo, &ifData, nullptr, 0, &needed, nullptr);
+        if (needed == 0) continue;
+
+        auto* detail = (PSP_DEVICE_INTERFACE_DETAIL_DATA)malloc(needed);
+        if (!detail) continue;
+        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
+
+        if (SetupDiGetDeviceInterfaceDetail(devInfo, &ifData, detail, needed, nullptr, nullptr)) {
+            // Try exclusive read first, fall back to shared.
+            // Exclusive succeeds only if no other app has the device open.
+            HANDLE h = CreateFile(detail->DevicePath,
+                                   GENERIC_READ | GENERIC_WRITE,
+                                   FILE_SHARE_WRITE,
+                                   nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+            bool exclusiveOk = (h != INVALID_HANDLE_VALUE);
+            if (!exclusiveOk) {
+                h = CreateFile(detail->DevicePath,
+                               GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+            }
+            if (h != INVALID_HANDLE_VALUE) {
+                HIDD_ATTRIBUTES attrs = {};
+                attrs.Size = sizeof(attrs);
+                if (HidD_GetAttributes(h, &attrs)) {
+                    std::ostringstream oss;
+                    oss << "[USB] HID found: VID=0x" << std::hex << std::setw(4) << std::setfill('0') << attrs.VendorID
+                        << " PID=0x" << std::setw(4) << attrs.ProductID;
+                    AppLog(oss.str());
+                    if (attrs.VendorID == SWITCH_VID && attrs.ProductID == PRO_CTRL_PID) {
+                        AppLog(exclusiveOk
+                            ? "[USB] Opened with EXCLUSIVE read — Forza cannot access real HID"
+                            : "[USB] Opened with SHARED read — close Chrome/Steam first for exclusive access");
+                        // Query report sizes from HID descriptor
+                        PHIDP_PREPARSED_DATA preparsed = nullptr;
+                        if (HidD_GetPreparsedData(h, &preparsed)) {
+                            HIDP_CAPS caps = {};
+                            if (HidP_GetCaps(preparsed, &caps) == HIDP_STATUS_SUCCESS) {
+                                g_hidInputReportLen  = caps.InputReportByteLength;
+                                g_hidOutputReportLen = caps.OutputReportByteLength;
+                                AppLog("[USB] HID caps: InputLen=" + std::to_string(caps.InputReportByteLength)
+                                    + " OutputLen=" + std::to_string(caps.OutputReportByteLength)
+                                    + " Usage=0x" + [&]{ std::ostringstream o; o << std::hex << caps.Usage; return o.str(); }());
+                            }
+                            HidD_FreePreparsedData(preparsed);
+                        }
+                        AppLog("[USB] Switch 2 Pro Controller matched!");
+                        found = h;
+                        free(detail);
+                        break;
+                    }
+                }
+                CloseHandle(h);
+            }
+        }
+        free(detail);
+    }
+
+    SetupDiDestroyDeviceInfoList(devInfo);
+    return found;
+}
+
+static uint8_t g_subcmdTimer = 0;
+
+// Allocate a zeroed output buffer matching the device's reported output report size
+static std::vector<uint8_t> MakeOutBuf() {
+    return std::vector<uint8_t>(g_hidOutputReportLen, 0);
+}
+
+// Write a Nintendo USB command (report ID 0x80, subcommand in byte 1)
+static bool SendUsbCmd(HANDLE hDev, uint8_t cmd) {
+    auto buf = MakeOutBuf();
+    buf[0] = 0x80;
+    buf[1] = cmd;
+    BOOL ok = HidD_SetOutputReport(hDev, buf.data(), (ULONG)buf.size());
+    if (!ok)
+        AppLog("[USB] SendUsbCmd 0x" + [&]{ std::ostringstream o; o << std::hex << (int)cmd; return o.str(); }()
+            + " failed, error=" + std::to_string(GetLastError()));
+    return ok != FALSE;
+}
+
+// Send a Nintendo subcommand (report ID 0x01, subcommand byte at offset 10)
+static bool SendSubcmd(HANDLE hDev, uint8_t subCmdId, const uint8_t* data, size_t dataLen) {
+    auto buf = MakeOutBuf();
+    buf[0] = 0x01;
+    buf[1] = g_subcmdTimer++;
+    // bytes 2-9: rumble data (leave zero)
+    if (buf.size() > 10) buf[10] = subCmdId;
+    if (data && dataLen > 0 && buf.size() > 11)
+        memcpy(buf.data() + 11, data, std::min(dataLen, buf.size() - 11));
+    BOOL ok = HidD_SetOutputReport(hDev, buf.data(), (ULONG)buf.size());
+    if (!ok)
+        AppLog("[USB] SendSubcmd 0x" + [&]{ std::ostringstream o; o << std::hex << (int)subCmdId; return o.str(); }()
+            + " failed, error=" + std::to_string(GetLastError()));
+    return ok != FALSE;
+}
+
+// Try to activate the controller by sending a haptic wakeup via report 0x02.
+// The Switch 2 Pro Controller requires some form of USB output before it starts
+// sending input. The haptic format is from procon2-driver (haptics.go).
+static bool TrySendActivation(HANDLE hDev, USHORT outLen) {
+    if (outLen < 64) { AppLog("[INIT] outLen too small for haptic"); return false; }
+
+    const uint8_t frame[5] = {0x93, 0x35, 0x36, 0x1c, 0x0d};
+    for (int i = 0; i < 3; i++) {
+        std::vector<uint8_t> buf(outLen, 0);
+        buf[0] = 0x02;
+        buf[1] = 0x50 | (uint8_t)(i & 0x0F);
+        memcpy(&buf[2], frame, 5);
+        buf[17] = buf[1];
+        memcpy(&buf[18], frame, 5);
+        OVERLAPPED ov = {}; ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        BOOL ok = WriteFile(hDev, buf.data(), outLen, nullptr, &ov);
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            DWORD d = 0; GetOverlappedResult(hDev, &ov, &d, TRUE); ok = TRUE;
+        }
+        CloseHandle(ov.hEvent);
+        AppLog("[INIT] haptic frame " + std::to_string(i) + " -> " + (ok ? "OK" : "FAIL err=" + std::to_string(GetLastError())));
+        Sleep(4);
+    }
+    // Stop
+    std::vector<uint8_t> stop(outLen, 0);
+    stop[0] = 0x02; stop[1] = 0x50; stop[17] = 0x50;
+    OVERLAPPED ov2 = {}; ov2.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    WriteFile(hDev, stop.data(), outLen, nullptr, &ov2);
+    if (GetLastError() == ERROR_IO_PENDING) { DWORD d = 0; GetOverlappedResult(hDev, &ov2, &d, TRUE); }
+    CloseHandle(ov2.hEvent);
+    return true;
+}
+
+// Wait up to timeoutMs for a single input report. Returns true if data arrived.
+static bool WaitForInput(HANDLE hDev, USHORT inLen, int timeoutMs) {
+    DWORD bufSz = std::max((USHORT)64, inLen);
+    std::vector<uint8_t> buf(bufSz);
+    OVERLAPPED ov = {}; ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    BOOL ok = ReadFile(hDev, buf.data(), bufSz, nullptr, &ov);
+    if (!ok && GetLastError() != ERROR_IO_PENDING) { CloseHandle(ov.hEvent); return false; }
+    bool got = (WaitForSingleObject(ov.hEvent, timeoutMs) == WAIT_OBJECT_0);
+    CancelIo(hDev);
+    CloseHandle(ov.hEvent);
+    return got;
+}
+
+// ─── Update policy ───────────────────────────────────────────────────────────
 
 using SteadyClock = std::chrono::steady_clock;
 using TimePoint   = SteadyClock::time_point;
 
-struct LatencyTracker {
-    TimePoint lastBleTime{};
-    TimePoint lastEmitTime{};
-    uint64_t  eventIndex = 0;
-};
-
-struct TimedInputBuffer {
-    std::vector<uint8_t> buffer;
-    TimePoint  receivedAt{};
-    double     bleDeltaMs = -1.0;
-    uint64_t   sequence   = 0;
-};
-
-struct DualJoyConSharedState {
-    std::mutex              mutex;
-    std::condition_variable cv;
-    TimedInputBuffer        left, right;
-    TimePoint               lastLeftBleTime{}, lastRightBleTime{}, lastEmitTime{};
-    uint64_t                sequence = 0, eventIndex = 0;
-};
-
-struct SingleJoyConPlayer {
-    ConnectedJoyCon joycon;
-    PVIGEM_TARGET   ds4Controller = nullptr;
-    JoyConSide      side;
-    JoyConOrientation orientation;
-    int             mouseMode      = 0;
-    bool            wasChatPressed = false;
-    int16_t         lastOpticalX   = 0, lastOpticalY = 0;
-    bool            firstOpticalRead = true;
-    float           scrollAccumulator = 0.f;
-    bool            mb4Pressed = false, mb5Pressed = false;
-    bool            leftBtnPressed = false, rightBtnPressed = false, middleBtnPressed = false;
-    LatencyTracker  latency;
-};
-
-struct DualJoyConPlayer {
-    ConnectedJoyCon leftJoyCon, rightJoyCon;
-    GyroSource      gyroSource;
-    GyroMode        gyroMode;
-    MotionProfile   motionProfile;
-    uint8_t         dsuSlot = 0;
-    PVIGEM_TARGET   ds4Controller = nullptr;
-    std::atomic<bool> running{false};
-    std::thread     updateThread;
-    std::shared_ptr<DualJoyConSharedState> sharedState;
-};
-
-struct ProControllerPlayer {
-    ConnectedJoyCon controller;
-    PVIGEM_TARGET   ds4Controller = nullptr;
-    LatencyTracker  latency;
-};
-
-struct ConnectionTask {
-    std::string        label;
-    bool               done    = false;
-    bool               success = false;
-    std::string        statusMsg;
-    ConnectedJoyCon    result;
-    std::thread        worker;
-};
-
-static AppScreen              g_screen        = AppScreen::Setup;
-static RuntimeOptions         g_opts;
-static ProControllerConfig    g_proConfig;
-static PVIGEM_CLIENT          g_vigem         = nullptr;
-static DsuServer              g_dsuServer;
-
-static std::vector<PlayerConfig>                    g_playerConfigs;
-static std::vector<SingleJoyConPlayer>              g_singlePlayers;
-static std::vector<std::unique_ptr<DualJoyConPlayer>> g_dualPlayers;
-static std::vector<ProControllerPlayer>             g_proPlayers;
-
-static std::vector<ConnectionTask>  g_connectionTasks;
-static int                          g_connectionTaskIndex = 0;
-static bool                         g_connectionDone      = false;
-static std::string                  g_connectionError;
-
-static bool g_showLayoutManager = false;
-static bool g_screenshotButtonPressed = false;
-static bool g_cButtonPressed          = false;
-static bool g_comboPressed            = false;
-static std::atomic<bool> g_openLayoutManager{false};
-
-static std::mutex         g_logMutex;
-static std::vector<std::string> g_logLines;
-static void AppLog(const std::string& s) {
-    std::lock_guard<std::mutex> lk(g_logMutex);
-    g_logLines.push_back(s);
-    if (g_logLines.size() > 200) g_logLines.erase(g_logLines.begin());
-}
-
-class LatencyCsvLogger {
-public:
-    bool Start(const std::string& path) {
-        std::lock_guard<std::mutex> lk(m_mutex);
-        m_file.open(path, std::ios::out | std::ios::trunc);
-        if (!m_file.is_open()) return false;
-        m_file << "mode,controller_type,event_index,ble_delta_ms,buffer_age_left_ms,buffer_age_right_ms,decode_to_vigem_us,total_pipeline_us\n";
-        m_enabled = true;
-        return true;
-    }
-    bool Enabled() const { return m_enabled.load(std::memory_order_acquire); }
-    void Record(UpdatePolicy pol, const char* ct, uint64_t idx,
-                double bleDelta, double ageL, double ageR, double decUs, double totUs) {
-        if (!Enabled()) return;
-        std::lock_guard<std::mutex> lk(m_mutex);
-        if (!m_file.is_open()) return;
-        m_file << PolicyName(pol) << ',' << ct << ',' << idx << ','
-               << std::fixed << std::setprecision(3)
-               << bleDelta << ',' << ageL << ',' << ageR << ','
-               << std::setprecision(1) << decUs << ',' << totUs << '\n';
-    }
-    static const char* PolicyName(UpdatePolicy p) {
-        switch(p) {
-            case UpdatePolicy::LowLatency:    return "LowLatency";
-            case UpdatePolicy::Balanced120Hz: return "Balanced120Hz";
-            case UpdatePolicy::Legacy60Hz:    return "Legacy60Hz";
-            default: return "Unknown";
-        }
-    }
-private:
-    std::atomic<bool> m_enabled{false};
-    std::mutex        m_mutex;
-    std::ofstream     m_file;
-};
-static LatencyCsvLogger g_latencyLogger;
-
-static double MsBetween(TimePoint a, TimePoint b) {
-    if (a == TimePoint{}) return -1.0;
-    return std::chrono::duration<double, std::milli>(b - a).count();
-}
-static double UsBetween(TimePoint a, TimePoint b) {
-    return std::chrono::duration<double, std::micro>(b - a).count();
-}
 static std::chrono::microseconds PolicyInterval(UpdatePolicy p) {
     switch(p) {
         case UpdatePolicy::Balanced120Hz: return std::chrono::microseconds(8333);
@@ -242,423 +449,218 @@ static std::chrono::microseconds PolicyInterval(UpdatePolicy p) {
         default:                          return std::chrono::microseconds(0);
     }
 }
+
 static bool ShouldEmit(UpdatePolicy p, TimePoint& last, TimePoint now) {
     auto iv = PolicyInterval(p);
     if (iv.count() == 0 || last == TimePoint{} || now - last >= iv) { last = now; return true; }
     return false;
 }
-static const char* CtrlTypeName(int t) {
-    switch(t) {
-        case 1: return "SingleJoyCon";
-        case 2: return "DualJoyCon";
-        case 3: return "ProController";
-        case 4: return "NSOGCController";
-        default: return "Unknown";
-    }
-}
 
-static const char* BtnMapNames[] = {
-    "None","L3","R3","L1","R1","L2","R2",
-    "Cross","Circle","Square","Triangle",
-    "Share","Options",
-    "DPad Up","DPad Down","DPad Left","DPad Right"
-};
-static const char* BtnMapStr(ButtonMapping m) { return BtnMapNames[(int)m]; }
-static ButtonMapping BtnMapFromStr(const std::string& s) {
-    for (int i = 0; i < 17; i++)
-        if (s == BtnMapNames[i]) return (ButtonMapping)i;
-    return ButtonMapping::NONE;
-}
+// ─── Read thread ─────────────────────────────────────────────────────────────
 
-static void SaveProConfig() {
-    std::ofstream f(CONFIG_FILE);
-    if (!f.is_open()) return;
-    f << "{\n  \"activeLayoutIndex\": " << g_proConfig.activeLayoutIndex << ",\n  \"layouts\": [\n";
-    for (size_t i = 0; i < g_proConfig.layouts.size(); ++i) {
-        auto& l = g_proConfig.layouts[i];
-        f << "    {\"name\":\"" << l.name << "\","
-          << "\"glMapping\":\"" << BtnMapStr(l.glMapping) << "\","
-          << "\"grMapping\":\"" << BtnMapStr(l.grMapping) << "\"}";
-        if (i+1 < g_proConfig.layouts.size()) f << ",";
-        f << "\n";
-    }
-    f << "  ]\n}\n";
-}
-static void LoadProConfig() {
-    std::ifstream f(CONFIG_FILE);
-    if (!f.is_open()) {
-        GLGRLayout def; def.glMapping = ButtonMapping::NONE; def.grMapping = ButtonMapping::NONE;
-        g_proConfig.layouts.push_back(def);
-        g_proConfig.activeLayoutIndex = 0;
-        SaveProConfig();
-        return;
-    }
-    std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    g_proConfig.layouts.clear(); g_proConfig.activeLayoutIndex = 0;
-    auto readField = [&](const std::string& key) -> std::string {
-        auto p = json.find("\"" + key + "\"");
-        if (p == std::string::npos) return "";
-        auto c = json.find(':', p); auto e = json.find_first_of(",}\n", c);
-        auto v = json.substr(c+1, e-c-1);
-        v.erase(0, v.find_first_not_of(" \t\n\r\""));
-        v.erase(v.find_last_not_of(" \t\n\r\"")+1);
-        return v;
-    };
-    try { g_proConfig.activeLayoutIndex = std::stoi(readField("activeLayoutIndex")); } catch(...) {}
-    size_t pos = json.find('[');
-    while (pos != std::string::npos) {
-        auto ob = json.find('{', pos);
-        if (ob == std::string::npos) break;
-        auto oe = json.find('}', ob);
-        if (oe == std::string::npos) break;
-        auto obj = json.substr(ob, oe-ob+1);
-        GLGRLayout lay;
-        auto getStr = [&](const std::string& key) -> std::string {
-            auto kp = obj.find("\""+key+"\"");
-            if (kp == std::string::npos) return "";
-            auto q1 = obj.find('"', kp+key.size()+2);
-            auto q2 = obj.find('"', q1+1);
-            return obj.substr(q1+1, q2-q1-1);
-        };
-        auto nm = getStr("name");
-        if (!nm.empty()) strncpy_s(lay.name, nm.c_str(), 63);
-        lay.glMapping = BtnMapFromStr(getStr("glMapping"));
-        lay.grMapping = BtnMapFromStr(getStr("grMapping"));
-        g_proConfig.layouts.push_back(lay);
-        pos = oe+1;
-    }
-    if (g_proConfig.layouts.empty()) {
-        GLGRLayout def; g_proConfig.layouts.push_back(def); g_proConfig.activeLayoutIndex = 0;
-    }
-    if (g_proConfig.activeLayoutIndex < 0 || g_proConfig.activeLayoutIndex >= (int)g_proConfig.layouts.size())
-        g_proConfig.activeLayoutIndex = 0;
-}
+static void ReadLoop(HANDLE hDev, PVIGEM_CLIENT vigem, PVIGEM_TARGET ds4) {
+    AppLog(g_useWinUSB
+        ? "[READ] Thread started — WinUSB mode (0x30 reports)"
+        : "[READ] Thread started — HID mode (0x09 reports), InputLen=" + std::to_string(g_hidInputReportLen));
 
-static void SendGenericCommand(GattCharacteristic const& ch, uint8_t cmdId, uint8_t subId, const std::vector<uint8_t>& data) {
-    if (!ch) return;
-    DataWriter w;
-    w.WriteByte(cmdId); w.WriteByte(0x91); w.WriteByte(0x01);
-    w.WriteByte(subId); w.WriteByte(0x00); w.WriteByte((uint8_t)data.size());
-    w.WriteByte(0x00); w.WriteByte(0x00);
-    for (auto b : data) w.WriteByte(b);
-    ch.WriteValueAsync(w.DetachBuffer(), GattWriteOption::WriteWithoutResponse).get();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-}
-static void SetPlayerLEDs(GattCharacteristic const& ch, uint8_t pat) {
-    std::vector<uint8_t> d(8, 0); d[0] = pat;
-    SendGenericCommand(ch, 0x09, 0x07, d);
-}
-static void EmitSound(GattCharacteristic const& ch) {
-    std::vector<uint8_t> d(8, 0); d[0] = 0x04;
-    SendGenericCommand(ch, 0x0A, 0x02, d);
-}
-static void SendCustomCommands(GattCharacteristic const& ch) {
-    std::vector<std::vector<uint8_t>> cmds = {
-        {0x0c,0x91,0x01,0x02,0x00,0x04,0x00,0x00,0xFF,0x00,0x00,0x00},
-        {0x0c,0x91,0x01,0x04,0x00,0x04,0x00,0x00,0xFF,0x00,0x00,0x00}
-    };
-    for (auto& cmd : cmds) {
-        DataWriter w; w.WriteBytes(cmd);
-        ch.WriteValueAsync(w.DetachBuffer(), GattWriteOption::WriteWithoutResponse).get();
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-}
+    const DWORD readBufSize = g_useWinUSB ? 64 : std::max((USHORT)64, g_hidInputReportLen);
+    std::vector<uint8_t> buf(readBufSize, 0);
+    OVERLAPPED ov = {};
+    ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
 
-static ConnectedJoyCon BleConnect(std::function<void(const std::string&)> statusCb, bool& outSuccess) {
-    outSuccess = false;
-    ConnectedJoyCon cj{};
-    BluetoothLEDevice device = nullptr;
-    bool found = false;
-    BluetoothLEAdvertisementWatcher watcher;
-    std::mutex mtx; std::condition_variable cv;
+    TimePoint lastEmit{};
+    int loggedReports = 0;
+    int unknownLog    = 0;
+    int noDataCount   = 0;
 
-    watcher.Received([&](auto const&, auto const& args) {
-        std::unique_lock<std::mutex> lk(mtx);
-        if (found) return;
-        auto mfg = args.Advertisement().ManufacturerData();
-        for (uint32_t i = 0; i < mfg.Size(); i++) {
-            auto sec = mfg.GetAt(i);
-            if (sec.CompanyId() != JOYCON_MANUFACTURER_ID) continue;
-            auto rdr = DataReader::FromBuffer(sec.Data());
-            std::vector<uint8_t> d(rdr.UnconsumedBufferLength());
-            rdr.ReadBytes(d);
-            if (d.size() >= JOYCON_MANUFACTURER_PREFIX.size() &&
-                std::equal(JOYCON_MANUFACTURER_PREFIX.begin(), JOYCON_MANUFACTURER_PREFIX.end(), d.begin())) {
-                device = BluetoothLEDevice::FromBluetoothAddressAsync(args.BluetoothAddress()).get();
-                if (!device) return;
-                found = true; watcher.Stop(); cv.notify_one();
+    while (g_running.load(std::memory_order_acquire)) {
+        ResetEvent(ov.hEvent);
+        std::fill(buf.begin(), buf.end(), 0);
+        BOOL pending;
+        if (g_useWinUSB) {
+            ULONG dummy = 0;
+            pending = !WinUsb_ReadPipe(g_winusbHandle, g_pipeIn, buf.data(), readBufSize, nullptr, &ov);
+        } else {
+            pending = !ReadFile(hDev, buf.data(), readBufSize, nullptr, &ov);
+        }
+
+        if (pending && GetLastError() != ERROR_IO_PENDING) {
+            AppLog("[READ] ReadFile error: " + std::to_string(GetLastError()));
+            break;
+        }
+
+        DWORD waitRes = WaitForSingleObject(ov.hEvent, 200);
+        if (waitRes == WAIT_TIMEOUT) {
+            noDataCount++;
+            if (noDataCount == 10) { // 2 seconds with no data
+                AppLog("[READ] No data for 2s — controller may need activation via procon2tool");
+                g_statusMsg = "No input. Open procon2tool (handheldlegend.github.io/procon2tool), activate controller, then this app will work.";
             }
+            continue;
         }
-    });
-    watcher.ScanningMode(BluetoothLEScanningMode::Active);
-    watcher.Start();
-    statusCb("Scanning... (hold sync button)");
-    {
-        std::unique_lock<std::mutex> lk(mtx);
-        if (!cv.wait_for(lk, std::chrono::seconds(30), [&]{ return found; })) {
-            watcher.Stop();
-            statusCb("Timed out — device not found");
-            return cj;
+        if (waitRes != WAIT_OBJECT_0) break;
+
+        DWORD bytesRead = 0;
+        if (!GetOverlappedResult(hDev, &ov, &bytesRead, FALSE) || bytesRead == 0) continue;
+        noDataCount = 0;
+
+        uint8_t reportId = buf[0];
+
+        if (loggedReports < 3) {
+            std::ostringstream oss;
+            oss << "[READ] #" << ++loggedReports << " ID=0x" << std::hex << (int)reportId
+                << " len=" << std::dec << bytesRead << " | ";
+            for (DWORD k = 0; k < std::min(bytesRead, (DWORD)16); k++)
+                oss << std::hex << std::setw(2) << std::setfill('0') << (int)buf[k] << " ";
+            AppLog(oss.str());
         }
-    }
-    statusCb("Device found, fetching GATT services...");
-    cj.device = device;
-    GattDeviceServicesResult sr = nullptr;
-    for (int att = 1; att <= 10; ++att) {
-        sr = device.GetGattServicesAsync(BluetoothCacheMode::Uncached).get();
-        if (sr.Status() == GattCommunicationStatus::Success) break;
-        statusCb("Retrying GATT (" + std::to_string(att) + "/10)...");
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-    if (!sr || sr.Status() != GattCommunicationStatus::Success) {
-        statusCb("Failed to get GATT services. Re-pair the device.");
-        return cj;
-    }
-    for (auto svc : sr.Services()) {
-        auto cr = svc.GetCharacteristicsAsync().get();
-        if (cr.Status() != GattCommunicationStatus::Success) continue;
-        for (auto ch : cr.Characteristics()) {
-            if (ch.Uuid() == guid(INPUT_REPORT_UUID))  cj.inputChar = ch;
-            if (ch.Uuid() == guid(WRITE_COMMAND_UUID)) cj.writeChar = ch;
+
+        // Accept 0x09 (standard HID) and 0x30/0x31 (Nintendo full format)
+        bool validReport = (reportId == 0x09 || reportId == 0x30 || reportId == 0x31);
+        if (!validReport) {
+            if (unknownLog++ < 5)
+                AppLog("[READ] Skipping report ID=0x" + [&]{ std::ostringstream o; o << std::hex << (int)reportId; return o.str(); }());
+            continue;
         }
+
+        auto now = SteadyClock::now();
+        if (!ShouldEmit(g_updatePolicy, lastEmit, now)) continue;
+
+        std::vector<uint8_t> report(buf.begin(), buf.begin() + bytesRead);
+
+        XUSB_REPORT xreport;
+        if (reportId == 0x30 || reportId == 0x31) {
+            report.resize(0x3C, 0);
+            xreport = GenerateProControllerXboxReport(report);
+        } else {
+            // 0x09: standard HID gamepad format (works for both HID and WinUSB)
+            xreport = GenerateSwitch2ProXboxReport(report);
+        }
+        vigem_target_x360_update(vigem, ds4, xreport);
     }
-    if (!cj.inputChar || !cj.writeChar) {
-        statusCb("Required GATT characteristics not found. Re-pair.");
-        return cj;
-    }
-    try {
-        cj.device.RequestPreferredConnectionParameters(BluetoothLEPreferredConnectionParameters::ThroughputOptimized());
-    } catch(...) {}
-    outSuccess = true;
-    statusCb("Connected!");
-    return cj;
+
+    CloseHandle(ov.hEvent);
+    AppLog("[READ] Thread stopped");
 }
 
-static void InitViGEm() {
-    if (g_vigem) return;
+// ─── ViGEm helpers ───────────────────────────────────────────────────────────
+
+static bool InitViGEm() {
+    if (g_vigem) return true;
     g_vigem = vigem_alloc();
-    if (!g_vigem || !VIGEM_SUCCESS(vigem_connect(g_vigem))) {
-        AppLog("[ERROR] ViGEm failed to connect");
+    if (!g_vigem) { AppLog("[VIGEM] vigem_alloc() returned null — ViGEmBus not installed?"); return false; }
+    VIGEM_ERROR err = vigem_connect(g_vigem);
+    if (!VIGEM_SUCCESS(err)) {
+        AppLog("[VIGEM] vigem_connect() failed, code=" + std::to_string((int)err)
+            + " — Is ViGEmBus installed and running?");
+        vigem_free(g_vigem); g_vigem = nullptr; return false;
     }
+    AppLog("[VIGEM] Connected OK");
+    return true;
 }
-static PVIGEM_TARGET AddDS4() {
-    auto t = vigem_target_ds4_alloc();
-    vigem_target_set_vid(t, 0x054C);
-    vigem_target_set_pid(t, 0x09CC);
-    vigem_target_add(g_vigem, t);
+
+static PVIGEM_TARGET AddXbox360() {
+    auto t = vigem_target_x360_alloc();
+    if (!t) { AppLog("[VIGEM] vigem_target_x360_alloc() failed"); return nullptr; }
+    VIGEM_ERROR err = vigem_target_add(g_vigem, t);
+    if (!VIGEM_SUCCESS(err)) {
+        AppLog("[VIGEM] vigem_target_add() failed, code=" + std::to_string((int)err));
+        vigem_target_free(t); return nullptr;
+    }
+    AppLog("[VIGEM] Xbox 360 virtual controller added");
     return t;
 }
 
-static void ApplyBtnMapping(DS4_REPORT_EX& r, ButtonMapping m) {
-    switch(m) {
-        case ButtonMapping::L3:       r.Report.wButtons |= DS4_BUTTON_THUMB_LEFT;    break;
-        case ButtonMapping::R3:       r.Report.wButtons |= DS4_BUTTON_THUMB_RIGHT;   break;
-        case ButtonMapping::L1:       r.Report.wButtons |= DS4_BUTTON_SHOULDER_LEFT; break;
-        case ButtonMapping::R1:       r.Report.wButtons |= DS4_BUTTON_SHOULDER_RIGHT;break;
-        case ButtonMapping::L2:       r.Report.bTriggerL = 255;                      break;
-        case ButtonMapping::R2:       r.Report.bTriggerR = 255;                      break;
-        case ButtonMapping::CROSS:    r.Report.wButtons |= DS4_BUTTON_CROSS;         break;
-        case ButtonMapping::CIRCLE:   r.Report.wButtons |= DS4_BUTTON_CIRCLE;        break;
-        case ButtonMapping::SQUARE:   r.Report.wButtons |= DS4_BUTTON_SQUARE;        break;
-        case ButtonMapping::TRIANGLE: r.Report.wButtons |= DS4_BUTTON_TRIANGLE;      break;
-        case ButtonMapping::SHARE:    r.Report.wButtons |= DS4_BUTTON_SHARE;         break;
-        case ButtonMapping::OPTIONS:  r.Report.wButtons |= DS4_BUTTON_OPTIONS;       break;
-        case ButtonMapping::DPAD_UP:    DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&r.Report), DS4_BUTTON_DPAD_NORTH); break;
-        case ButtonMapping::DPAD_DOWN:  DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&r.Report), DS4_BUTTON_DPAD_SOUTH); break;
-        case ButtonMapping::DPAD_LEFT:  DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&r.Report), DS4_BUTTON_DPAD_WEST);  break;
-        case ButtonMapping::DPAD_RIGHT: DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&r.Report), DS4_BUTTON_DPAD_EAST);  break;
-        default: break;
-    }
-}
-static void ApplyGLGR(DS4_REPORT_EX& r, const std::vector<uint8_t>& buf) {
-    if (buf.size() < 9 || g_proConfig.layouts.empty()) return;
-    int li = g_proConfig.activeLayoutIndex;
-    if (li < 0 || li >= (int)g_proConfig.layouts.size()) li = 0;
-    auto& lay = g_proConfig.layouts[li];
-    uint64_t st = 0;
-    for (int i = 3; i <= 8; ++i) st = (st << 8) | buf[i];
-    if (st & 0x000000000200ULL) ApplyBtnMapping(r, lay.glMapping);
-    if (st & 0x000000000100ULL) ApplyBtnMapping(r, lay.grMapping);
-}
-static void HandleSpecialProButtons(const std::vector<uint8_t>& buf) {
-    if (buf.size() < 9) return;
-    uint64_t st = 0;
-    for (int i = 3; i <= 8; ++i) st = (st << 8) | buf[i];
-    constexpr uint64_t SCREENSHOT = 0x000020000000;
-    constexpr uint64_t CBTN       = 0x000040000000;
-    constexpr uint64_t GL         = 0x000000000200;
-    constexpr uint64_t GR         = 0x000000000100;
-    constexpr uint64_t ZL         = 0x000000800000;
-    constexpr uint64_t ZR         = 0x008000000000;
+// ─── Connection lifecycle ────────────────────────────────────────────────────
 
-    bool combo = (st & ZL) && (st & ZR) && (st & GL) && (st & GR);
-    if (combo && !g_comboPressed) { g_openLayoutManager.store(true); g_comboPressed = true; }
-    else if (!combo) g_comboPressed = false;
+static void DoConnect() {
+    g_connectError.clear();
+    g_screen = AppScreen::Connecting;
 
-    bool screenshot = (st & SCREENSHOT) != 0;
-    if (screenshot && !g_screenshotButtonPressed) { INPUT ip{}; ip.type=INPUT_KEYBOARD; ip.ki.wVk=VK_F12; SendInput(1,&ip,sizeof(ip)); g_screenshotButtonPressed=true; }
-    else if (!screenshot && g_screenshotButtonPressed) { INPUT ip{}; ip.type=INPUT_KEYBOARD; ip.ki.wVk=VK_F12; ip.ki.dwFlags=KEYEVENTF_KEYUP; SendInput(1,&ip,sizeof(ip)); g_screenshotButtonPressed=false; }
+    std::thread([]() {
+        AppLog("[CONNECT] Searching for Switch 2 Pro Controller (VID=057E PID=2069)...");
 
-    bool cBtn = (st & CBTN) != 0;
-    if (cBtn && !g_cButtonPressed) {
-        if (!g_proConfig.layouts.empty()) {
-            g_proConfig.activeLayoutIndex = (g_proConfig.activeLayoutIndex + 1) % (int)g_proConfig.layouts.size();
-            SaveProConfig();
-            AppLog(std::string("Layout -> ") + g_proConfig.layouts[g_proConfig.activeLayoutIndex].name);
+        if (!InitViGEm()) {
+            g_connectError = "ViGEmBus not installed or not running. Install ViGEmBus driver.";
+            g_screen = AppScreen::Setup; return;
         }
-        g_cButtonPressed = true;
-    } else if (!cBtn) g_cButtonPressed = false;
-}
 
-static void SendKey(WORD vk, bool down) {
-    INPUT ip{}; ip.type=INPUT_KEYBOARD; ip.ki.wVk=vk;
-    ip.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
-    SendInput(1, &ip, sizeof(ip));
-}
-
-struct CalibWizard {
-    bool active   = false;
-    int  step     = 0;
-    bool isLeft   = true;
-    int rawX = 2048, rawY = 2048;
-    int centerX = 2048, centerY = 2048;
-    int minX = 4095, maxX = 0, minY = 4095, maxY = 0;
-    bool capturing = false;
-    int  captureFrames = 0;
-    std::vector<uint8_t> lastBuf;
-};
-static CalibWizard  g_calib;
-static std::mutex   g_calibBufMutex;
-
-static void ResetCalib(bool isLeft) {
-    g_calib.active        = true;
-    g_calib.step          = 0;
-    g_calib.isLeft        = isLeft;
-    g_calib.rawX          = 2048;
-    g_calib.rawY          = 2048;
-    g_calib.centerX       = 2048;
-    g_calib.centerY       = 2048;
-    g_calib.minX          = 4095;
-    g_calib.maxX          = 0;
-    g_calib.minY          = 4095;
-    g_calib.maxY          = 0;
-    g_calib.capturing     = false;
-    g_calib.captureFrames = 0;
-    {
-        std::lock_guard<std::mutex> lk(g_calibBufMutex);
-        g_calib.lastBuf.clear();
-    }
-}
-
-static void FeedCalibBuffer(const std::vector<uint8_t>& buf, bool isLeftSide) {
-    if (!g_calib.active) return;
-    if (g_calib.isLeft != isLeftSide) return;
-    std::lock_guard<std::mutex> lk(g_calibBufMutex);
-    g_calib.lastBuf = buf;
-}
-
-static void UpdateCalibLiveValues() {
-    std::lock_guard<std::mutex> lk(g_calibBufMutex);
-    if (g_calib.lastBuf.size() < 16) return;
-    ExtractRawStick(g_calib.lastBuf, g_calib.isLeft, g_calib.rawX, g_calib.rawY);
-    if (g_calib.capturing) {
-        g_calib.minX = std::min(g_calib.minX, g_calib.rawX);
-        g_calib.maxX = std::max(g_calib.maxX, g_calib.rawX);
-        g_calib.minY = std::min(g_calib.minY, g_calib.rawY);
-        g_calib.maxY = std::max(g_calib.maxY, g_calib.rawY);
-        ++g_calib.captureFrames;
-    }
-}
-
-static void AttachSingleJoyConHandler(SingleJoyConPlayer& player, GyroMode gyroMode, MotionProfile motionProfile, uint8_t dsuSlot) {
-    player.joycon.inputChar.ValueChanged(
-        [&player, gyroMode, motionProfile, dsuSlot]
-        (GattCharacteristic const&, GattValueChangedEventArgs const& args)
-    {
-        const auto now = SteadyClock::now();
-        auto rdr = DataReader::FromBuffer(args.CharacteristicValue());
-        std::vector<uint8_t> buf(rdr.UnconsumedBufferLength());
-        rdr.ReadBytes(buf);
-
-        FeedCalibBuffer(buf, player.side == JoyConSide::Left);
-
-        const double bleDelta = MsBetween(player.latency.lastBleTime, now);
-        player.latency.lastBleTime = now;
-
-        if (player.side == JoyConSide::Right) {
-            uint32_t btnState = ExtractButtonState(buf);
-            bool chatPressed = (btnState & 0x000040) != 0;
-            if (chatPressed && !player.wasChatPressed) {
-                player.mouseMode = (player.mouseMode + 1) % 4;
-                const char* names[] = {"OFF","FAST","NORMAL","SLOW"};
-                uint8_t leds[] = {0x01, 0x02, 0x04, 0x08};
-                AppLog(std::string("Mouse mode: ") + names[player.mouseMode]);
-                SetPlayerLEDs(player.joycon.writeChar, leds[player.mouseMode]);
-                EmitSound(player.joycon.writeChar);
+        // ── Try WinUSB first (requires Zadig driver installed) ──────────────
+        HANDLE hDev = FindProControllerWinUSB();
+        if (hDev != INVALID_HANDLE_VALUE) {
+            AppLog("[CONNECT] WinUSB device opened — initialising Nintendo protocol...");
+            if (!InitWinUSBIface(hDev)) {
+                g_connectError = "WinUSB initialisation failed. Try reinstalling Zadig driver.";
+                CloseHandle(hDev); g_screen = AppScreen::Setup; return;
             }
-            player.wasChatPressed = chatPressed;
-
-            if (player.mouseMode > 0) {
-                auto [rx, ry] = GetRawOpticalMouse(buf);
-                if (player.firstOpticalRead) { player.lastOpticalX=rx; player.lastOpticalY=ry; player.firstOpticalRead=false; }
-                else {
-                    int16_t dx=rx-player.lastOpticalX, dy=ry-player.lastOpticalY;
-                    player.lastOpticalX=rx; player.lastOpticalY=ry;
-                    if (dx||dy) {
-                        float s = player.mouseMode==1?1.f:player.mouseMode==2?0.6f:0.3f;
-                        INPUT ip{}; ip.type=INPUT_MOUSE; ip.mi.dx=(int)(dx*s); ip.mi.dy=(int)(dy*s); ip.mi.dwFlags=MOUSEEVENTF_MOVE;
-                        SendInput(1,&ip,sizeof(ip));
-                    }
-                }
-                bool R=(btnState&0x004000)!=0, ZR=(btnState&0x008000)!=0, ST=(btnState&0x000004)!=0;
-                auto mkMouse=[](DWORD f){INPUT ip{}; ip.type=INPUT_MOUSE; ip.mi.dwFlags=f; SendInput(1,&ip,sizeof(ip));};
-                if (R&&!player.leftBtnPressed)   mkMouse(MOUSEEVENTF_LEFTDOWN);
-                if (!R&&player.leftBtnPressed)   mkMouse(MOUSEEVENTF_LEFTUP);
-                player.leftBtnPressed=R;
-                if (ZR&&!player.rightBtnPressed) mkMouse(MOUSEEVENTF_RIGHTDOWN);
-                if (!ZR&&player.rightBtnPressed) mkMouse(MOUSEEVENTF_RIGHTUP);
-                player.rightBtnPressed=ZR;
-                if (ST&&!player.middleBtnPressed) mkMouse(MOUSEEVENTF_MIDDLEDOWN);
-                if (!ST&&player.middleBtnPressed) mkMouse(MOUSEEVENTF_MIDDLEUP);
-                player.middleBtnPressed=ST;
-
-                auto sd = DecodeJoystick(buf, player.side, player.orientation);
-                const int SZ=4000, BT=28000;
-                if (abs(sd.y)>SZ) {
-                    float inten=(abs(sd.y)-SZ)/(32767.f-SZ);
-                    float spd=inten*40.f;
-                    player.scrollAccumulator += sd.y>0 ? -spd : spd;
-                    if (abs(player.scrollAccumulator)>=120.f) {
-                        int clicks=(int)(player.scrollAccumulator/120.f);
-                        player.scrollAccumulator-=clicks*120.f;
-                        INPUT ip{}; ip.type=INPUT_MOUSE; ip.mi.mouseData=clicks*120; ip.mi.dwFlags=MOUSEEVENTF_WHEEL;
-                        SendInput(1,&ip,sizeof(ip));
-                    }
-                } else player.scrollAccumulator=0.f;
-                auto mkX=[](DWORD xb, DWORD f){INPUT ip{}; ip.type=INPUT_MOUSE; ip.mi.mouseData=xb; ip.mi.dwFlags=f; SendInput(1,&ip,sizeof(ip));};
-                if (sd.x<-BT&&!player.mb4Pressed) { mkX(XBUTTON1,MOUSEEVENTF_XDOWN); mkX(XBUTTON1,MOUSEEVENTF_XUP); player.mb4Pressed=true; }
-                else if (sd.x>=-BT) player.mb4Pressed=false;
-                if (sd.x>BT&&!player.mb5Pressed) { mkX(XBUTTON2,MOUSEEVENTF_XDOWN); mkX(XBUTTON2,MOUSEEVENTF_XUP); player.mb5Pressed=true; }
-                else if (sd.x<=BT) player.mb5Pressed=false;
-                buf[4]&=~0x40; buf[4]&=~0x80; buf[5]&=~0x04;
-                if (buf.size()>=16){buf[13]=0x00;buf[14]=0x08;buf[15]=0x80;}
-            } else player.firstOpticalRead=true;
+            InitProControllerWinUSB();
+            g_useWinUSB = true;
+            g_statusMsg = "Connected (WinUSB — exclusive, Forza cannot see raw HID)";
+            AppLog("[CONNECT] WinUSB mode active");
+        } else {
+            // ── Fall back to standard HID ─────────────────────────────────
+            AppLog("[CONNECT] WinUSB not found (Zadig not installed?) — falling back to HID...");
+            hDev = FindProController();
+            if (hDev == INVALID_HANDLE_VALUE) {
+                g_connectError = "Controller not found. Connect via USB. For exclusive access install Zadig (winusb).";
+                g_screen = AppScreen::Setup; return;
+            }
+            AppLog("[CONNECT] HID device opened");
+            TrySendActivation(hDev, g_hidOutputReportLen);
+            bool activated = WaitForInput(hDev, g_hidInputReportLen, 2000);
+            if (!activated) {
+                AppLog("[CONNECT] No input — controller may need activation");
+                g_statusMsg = "HID mode — no input yet. Try procon2tool once if stuck.";
+            } else {
+                g_statusMsg = "Connected (HID shared — Forza may still see raw controller)";
+            }
+            g_useWinUSB = false;
         }
 
-        if (!ShouldEmit(g_opts.updatePolicy, player.latency.lastEmitTime, SteadyClock::now())) return;
-        const auto ds = SteadyClock::now();
-        MotionProfile mp = (gyroMode==GyroMode::DsuUdp) ? MotionProfile::Raw : motionProfile;
-        DS4_REPORT_EX report = GenerateDS4Report(buf, player.side, player.orientation, mp);
-        if (gyroMode==GyroMode::DsuUdp && g_dsuServer.IsRunning()) {
-            DS4_REPORT_EX dr = GenerateDS4Report(buf, player.side, player.orientation, MotionProfile::SwitchEmu);
-            g_dsuServer.UpdateController(dsuSlot, dr);
+        g_ds4 = AddXbox360();
+        if (!g_ds4) {
+            g_connectError = "Failed to create DS4 virtual controller (ViGEmBus issue).";
+            CloseHandle(hDev); g_screen = AppScreen::Setup; return;
         }
-        vigem_target_ds4_update_ex(g_vigem, player.ds4Controller, report);
-        const auto vc = SteadyClock::now();
-        g_latencyLogger.Record(g_opts.updatePolicy, CtrlTypeName(1), ++player.latency.eventIndex,
-                               bleDelta, 0.0, -1.0, UsBetween(ds,vc), UsBetween(now,vc));
-    });
+
+        if (g_dsuEnabled) {
+            g_dsuServer.Start();
+            g_dsuServer.SetControllerConnected(0);
+        }
+
+        g_hidDevice = hDev;
+        g_running.store(true, std::memory_order_release);
+        g_readThread = std::thread(ReadLoop, hDev, g_vigem, g_ds4);
+
+        AppLog("[CONNECT] Switch 2 Pro Controller running!");
+        g_screen = AppScreen::Running;
+    }).detach();
 }
+
+static void DoDisconnect() {
+    g_running.store(false, std::memory_order_release);
+    if (g_useWinUSB && g_winusbHandle)
+        WinUsb_AbortPipe(g_winusbHandle, g_pipeIn);
+    if (g_readThread.joinable()) g_readThread.join();
+
+    if (g_winusbHandle) { WinUsb_Free(g_winusbHandle); g_winusbHandle = nullptr; }
+    g_useWinUSB = false;
+
+    if (g_hidDevice != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_hidDevice);
+        g_hidDevice = INVALID_HANDLE_VALUE;
+    }
+    if (g_ds4 && g_vigem) {
+        vigem_target_remove(g_vigem, g_ds4);
+        vigem_target_free(g_ds4);
+        g_ds4 = nullptr;
+    }
+    g_dsuServer.Stop();
+    AppLog("[CONNECT] Disconnected");
+    g_screen = AppScreen::Setup;
+}
+
+// ─── D3D11 ───────────────────────────────────────────────────────────────────
 
 static ID3D11Device*           g_pd3dDevice       = nullptr;
 static ID3D11DeviceContext*    g_pd3dDeviceContext = nullptr;
@@ -672,25 +674,26 @@ static void CreateRTV() {
     g_pd3dDevice->CreateRenderTargetView(bb, nullptr, &g_mainRTV);
     bb->Release();
 }
-static void CleanupRTV() { if (g_mainRTV){g_mainRTV->Release();g_mainRTV=nullptr;} }
+static void CleanupRTV() { if (g_mainRTV){ g_mainRTV->Release(); g_mainRTV=nullptr; } }
+
 static bool CreateDX11(HWND hwnd) {
     DXGI_SWAP_CHAIN_DESC sd{};
-    sd.BufferCount=2; sd.BufferDesc.Width=0; sd.BufferDesc.Height=0;
-    sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferCount=2; sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.BufferDesc.RefreshRate.Numerator=60; sd.BufferDesc.RefreshRate.Denominator=1;
     sd.Flags=DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
     sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow=hwnd;
     sd.SampleDesc.Count=1; sd.Windowed=TRUE; sd.SwapEffect=DXGI_SWAP_EFFECT_DISCARD;
     D3D_FEATURE_LEVEL fl;
-    if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,
-        D3D11_SDK_VERSION,&sd,&g_pSwapChain,&g_pd3dDevice,&fl,&g_pd3dDeviceContext))) return false;
+    if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
+        nullptr, 0, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &fl, &g_pd3dDeviceContext)))
+        return false;
     CreateRTV(); return true;
 }
 static void CleanupDX11() {
     CleanupRTV();
-    if (g_pSwapChain)        { g_pSwapChain->Release();        g_pSwapChain=nullptr; }
-    if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release();  g_pd3dDeviceContext=nullptr; }
-    if (g_pd3dDevice)        { g_pd3dDevice->Release();         g_pd3dDevice=nullptr; }
+    if (g_pSwapChain)        { g_pSwapChain->Release();       g_pSwapChain=nullptr; }
+    if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext=nullptr; }
+    if (g_pd3dDevice)        { g_pd3dDevice->Release();        g_pd3dDevice=nullptr; }
 }
 
 static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -699,12 +702,12 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case WM_SIZE:
             if (g_pd3dDevice && wParam != SIZE_MINIMIZED) {
                 CleanupRTV();
-                g_pSwapChain->ResizeBuffers(0,(UINT)LOWORD(lParam),(UINT)HIWORD(lParam),DXGI_FORMAT_UNKNOWN,0);
+                g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
                 CreateRTV();
             }
             return 0;
         case WM_SYSCOMMAND:
-            if ((wParam&0xfff0)==SC_KEYMENU) return 0;
+            if ((wParam & 0xfff0) == SC_KEYMENU) return 0;
             break;
         case WM_DESTROY:
             PostQuitMessage(0); return 0;
@@ -712,64 +715,18 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-static void HelpMarker(const char* txt) {
-    ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered()) { ImGui::BeginTooltip(); ImGui::TextUnformatted(txt); ImGui::EndTooltip(); }
-}
+// ─── GUI ─────────────────────────────────────────────────────────────────────
 
-static void DrawPlayerConfigRow(int i, PlayerConfig& cfg) {
-    ImGui::PushID(i);
-    ImGui::TableNextRow();
-
-    ImGui::TableSetColumnIndex(0);
-    ImGui::Text("Player %d", i+1);
-
-    ImGui::TableSetColumnIndex(1);
-    const char* ctypes[] = {"Single JoyCon","Dual JoyCon","Pro Controller","NSO GC"};
-    int ct = (int)cfg.controllerType - 1;
-    ImGui::SetNextItemWidth(-1);
-    if (ImGui::Combo("##type", &ct, ctypes, 4))
-        cfg.controllerType = (ControllerType)(ct+1);
-
-    ImGui::TableSetColumnIndex(2);
-    if (cfg.controllerType == SingleJoyCon) {
-        const char* sides[] = {"Left","Right"};
-        int s = (cfg.joyconSide == JoyConSide::Left) ? 0 : 1;
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::Combo("##side", &s, sides, 2))
-            cfg.joyconSide = s==0 ? JoyConSide::Left : JoyConSide::Right;
-    } else ImGui::TextDisabled("—");
-
-    ImGui::TableSetColumnIndex(3);
-    if (cfg.controllerType == SingleJoyCon) {
-        const char* orients[] = {"Upright","Sideways"};
-        int o = (cfg.joyconOrientation == JoyConOrientation::Upright) ? 0 : 1;
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::Combo("##orient", &o, orients, 2))
-            cfg.joyconOrientation = o==0 ? JoyConOrientation::Upright : JoyConOrientation::Sideways;
-    } else ImGui::TextDisabled("—");
-
-    ImGui::TableSetColumnIndex(4);
-    if (cfg.controllerType == DualJoyCon) {
-        const char* gs[] = {"Both","Left","Right"};
-        int g = (cfg.gyroSource==GyroSource::Both)?0:(cfg.gyroSource==GyroSource::Left)?1:2;
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::Combo("##gyrosrc", &g, gs, 3))
-            cfg.gyroSource = g==0?GyroSource::Both:g==1?GyroSource::Left:GyroSource::Right;
-    } else ImGui::TextDisabled("—");
-
-    ImGui::TableSetColumnIndex(5);
-    if (cfg.controllerType != NSOGCController) {
-        const char* gm[] = {"DS4 Raw","DS4 Switch Emu","DSU UDP"};
-        int gv = (cfg.gyroMode==GyroMode::DS4Raw)?0:(cfg.gyroMode==GyroMode::DS4SwitchEmu)?1:2;
-        ImGui::SetNextItemWidth(-1);
-        if (ImGui::Combo("##gyromode", &gv, gm, 3)) {
-            cfg.gyroMode = gv==0?GyroMode::DS4Raw:gv==1?GyroMode::DS4SwitchEmu:GyroMode::DsuUdp;
-            cfg.motionProfile = gv==0?MotionProfile::Raw:MotionProfile::SwitchEmu;
-        }
-    } else ImGui::TextDisabled("—");
-
-    ImGui::PopID();
+static void DrawLog() {
+    if (ImGui::CollapsingHeader("Log", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::BeginChild("##log", {-1, 180}, true);
+        std::lock_guard<std::mutex> lk(g_logMutex);
+        for (auto& line : g_logLines)
+            ImGui::TextUnformatted(line.c_str());
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+            ImGui::SetScrollHereY(1.f);
+        ImGui::EndChild();
+    }
 }
 
 static void DrawSetupScreen() {
@@ -779,329 +736,42 @@ static void DrawSetupScreen() {
         ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoCollapse);
 
     ImGui::Spacing();
-    ImGui::SetCursorPosX((io.DisplaySize.x - ImGui::CalcTextSize("joycon2cpp").x) * 0.5f);
-    ImGui::TextColored({0.4f,0.8f,1.f,1.f}, "joycon2cpp");
+    const char* title = "Switch 2 Pro Controller";
+    ImGui::SetCursorPosX((io.DisplaySize.x - ImGui::CalcTextSize(title).x) * 0.5f);
+    ImGui::TextColored({0.4f,0.8f,1.f,1.f}, "%s", title);
     ImGui::Separator(); ImGui::Spacing();
 
-    if (ImGui::CollapsingHeader("Players", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Spacing();
-        if (ImGui::BeginTable("players", 6,
-            ImGuiTableFlags_Borders|ImGuiTableFlags_RowBg|ImGuiTableFlags_SizingStretchProp)) {
-            ImGui::TableSetupColumn("Player",       ImGuiTableColumnFlags_WidthFixed, 60);
-            ImGui::TableSetupColumn("Type",         ImGuiTableColumnFlags_WidthStretch, 1.4f);
-            ImGui::TableSetupColumn("Side",         ImGuiTableColumnFlags_WidthStretch, 0.8f);
-            ImGui::TableSetupColumn("Orientation",  ImGuiTableColumnFlags_WidthStretch, 0.9f);
-            ImGui::TableSetupColumn("Gyro Source",  ImGuiTableColumnFlags_WidthStretch, 0.9f);
-            ImGui::TableSetupColumn("Gyro Output",  ImGuiTableColumnFlags_WidthStretch, 1.2f);
-            ImGui::TableHeadersRow();
+    ImGui::TextWrapped("Connect your Switch 2 Pro Controller via USB, then click Connect.");
+    ImGui::Spacing();
 
-            for (int i = 0; i < (int)g_playerConfigs.size(); ++i)
-                DrawPlayerConfigRow(i, g_playerConfigs[i]);
-
-            ImGui::EndTable();
-        }
-        ImGui::Spacing();
-        if (ImGui::Button("+ Add Player") && g_playerConfigs.size() < 4)
-            g_playerConfigs.push_back({});
-        ImGui::SameLine();
-        if (ImGui::Button("- Remove Last") && g_playerConfigs.size() > 1)
-            g_playerConfigs.pop_back();
+    if (!g_connectError.empty()) {
+        ImGui::TextColored({1.f,0.3f,0.3f,1.f}, "%s", g_connectError.c_str());
         ImGui::Spacing();
     }
 
     if (ImGui::CollapsingHeader("Settings")) {
-        ImGui::Spacing();
-        ImGui::Indent(10);
-
-        const char* policies[] = {"Low Latency (immediate)","Balanced 120Hz","Legacy 60Hz"};
-        int pol = (int)g_opts.updatePolicy;
-        ImGui::SetNextItemWidth(220);
+        ImGui::Indent(10); ImGui::Spacing();
+        const char* policies[] = {"Low Latency (immediate)", "Balanced 120 Hz", "Legacy 60 Hz"};
+        int pol = (int)g_updatePolicy;
+        ImGui::SetNextItemWidth(260);
         if (ImGui::Combo("Update Policy", &pol, policies, 3))
-            g_opts.updatePolicy = (UpdatePolicy)pol;
-        ImGui::SameLine(); HelpMarker("Low Latency forwards every BLE packet immediately.\nBalanced/Legacy cap the output rate.");
-
-        ImGui::Checkbox("Record latency metrics to CSV", &g_opts.latencyMetrics);
-        if (g_opts.latencyMetrics) {
-            ImGui::SetNextItemWidth(300);
-            ImGui::InputText("CSV path", g_opts.latencyCsvPath, sizeof(g_opts.latencyCsvPath));
-        }
-
-        ImGui::Unindent(10);
-        ImGui::Spacing();
-    }
-
-    if (ImGui::CollapsingHeader("Stick Calibration")) {
-        ImGui::Spacing();
-        ImGui::Indent(10);
-        ImGui::TextWrapped("Calibrate after connecting. Connect your controllers first, then open this panel in-session.");
-
-        const auto& cal = GetActiveCalibration();
-        ImGui::Spacing();
-        if (ImGui::BeginTable("calvals", 4, ImGuiTableFlags_Borders|ImGuiTableFlags_SizingStretchSame)) {
-            ImGui::TableSetupColumn("Stick"); ImGui::TableSetupColumn("Center");
-            ImGui::TableSetupColumn("Range X"); ImGui::TableSetupColumn("Range Y");
-            ImGui::TableHeadersRow();
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0); ImGui::Text("Left");
-            ImGui::TableSetColumnIndex(1); ImGui::Text("%d, %d", cal.leftStick.centerX, cal.leftStick.centerY);
-            ImGui::TableSetColumnIndex(2); ImGui::Text("%d–%d", cal.leftStick.minX, cal.leftStick.maxX);
-            ImGui::TableSetColumnIndex(3); ImGui::Text("%d–%d", cal.leftStick.minY, cal.leftStick.maxY);
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0); ImGui::Text("Right");
-            ImGui::TableSetColumnIndex(1); ImGui::Text("%d, %d", cal.rightStick.centerX, cal.rightStick.centerY);
-            ImGui::TableSetColumnIndex(2); ImGui::Text("%d–%d", cal.rightStick.minX, cal.rightStick.maxX);
-            ImGui::TableSetColumnIndex(3); ImGui::Text("%d–%d", cal.rightStick.minY, cal.rightStick.maxY);
-            ImGui::EndTable();
-        }
-
-        ImGui::Spacing();
-        if (ImGui::Button("Reset to defaults")) {
-            CalibrationProfile def;
-            def.name = "Default";
-            while (GetCalibrationProfiles().size() > 1)
-                DeleteCalibrationProfile(1);
-            DeleteCalibrationProfile(0);
-            AddCalibrationProfile(def);
-            SetActiveCalibrationIndex(0);
-            SaveCalibrationProfiles("calibration.json");
-        }
-        ImGui::Unindent(10);
-        ImGui::Spacing();
-    }
-
-    bool hasProController = false;
-    for (auto& pc : g_playerConfigs) if (pc.controllerType == ProController) { hasProController = true; break; }
-    if (hasProController && ImGui::CollapsingHeader("Pro Controller GL/GR Layouts")) {
-        ImGui::Spacing();
-        ImGui::Indent(10);
-        ImGui::Text("Active layout: %s", g_proConfig.layouts[g_proConfig.activeLayoutIndex].name);
-        ImGui::Spacing();
-        for (int i = 0; i < (int)g_proConfig.layouts.size(); ++i) {
-            ImGui::PushID(i);
-            auto& lay = g_proConfig.layouts[i];
-            bool isActive = (i == g_proConfig.activeLayoutIndex);
-            if (isActive) ImGui::PushStyleColor(ImGuiCol_Header, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
-            bool open = ImGui::TreeNodeEx(lay.name, ImGuiTreeNodeFlags_Framed);
-            if (isActive) ImGui::PopStyleColor();
-            if (open) {
-                ImGui::InputText("Name##n", lay.name, 64);
-                int gl = (int)lay.glMapping, gr = (int)lay.grMapping;
-                ImGui::SetNextItemWidth(160); ImGui::Combo("GL##gl", &gl, BtnMapNames, 17); lay.glMapping=(ButtonMapping)gl;
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(160); ImGui::Combo("GR##gr", &gr, BtnMapNames, 17); lay.grMapping=(ButtonMapping)gr;
-                ImGui::Spacing();
-                if (!isActive && ImGui::Button("Set Active")) { g_proConfig.activeLayoutIndex=i; SaveProConfig(); }
-                ImGui::SameLine();
-                if (g_proConfig.layouts.size()>1 && ImGui::Button("Delete")) {
-                    g_proConfig.layouts.erase(g_proConfig.layouts.begin()+i);
-                    if (g_proConfig.activeLayoutIndex>=(int)g_proConfig.layouts.size())
-                        g_proConfig.activeLayoutIndex=(int)g_proConfig.layouts.size()-1;
-                    SaveProConfig(); ImGui::TreePop(); ImGui::PopID(); break;
-                }
-                SaveProConfig();
-                ImGui::TreePop();
-            }
-            ImGui::PopID();
-        }
-        if (ImGui::Button("+ New Layout")) {
-            GLGRLayout nl; snprintf(nl.name,64,"Layout %d",(int)g_proConfig.layouts.size()+1);
-            g_proConfig.layouts.push_back(nl); SaveProConfig();
-        }
-        ImGui::Unindent(10);
-        ImGui::Spacing();
+            g_updatePolicy = (UpdatePolicy)pol;
+        ImGui::Checkbox("Enable DSU Server (Cemuhook / gyro forwarding)", &g_dsuEnabled);
+        ImGui::Unindent(10); ImGui::Spacing();
     }
 
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
-    float btnW = 180;
+    float btnW = 160.f;
     ImGui::SetCursorPosX((io.DisplaySize.x - btnW) * 0.5f);
     ImGui::PushStyleColor(ImGuiCol_Button,        {0.2f,0.6f,0.2f,1.f});
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.3f,0.75f,0.3f,1.f});
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  {0.15f,0.5f,0.15f,1.f});
-    bool doConnect = ImGui::Button("Connect Controllers", {btnW, 36});
+    if (ImGui::Button("Connect", {btnW, 36})) DoConnect();
     ImGui::PopStyleColor(3);
+    ImGui::Spacing();
 
-    if (doConnect && !g_playerConfigs.empty()) {
-        g_connectionTasks.clear();
-        for (int i = 0; i < (int)g_playerConfigs.size(); ++i) {
-            auto& pc = g_playerConfigs[i];
-            if (pc.controllerType == SingleJoyCon) {
-                std::string side = (pc.joyconSide==JoyConSide::Left)?"Left":"Right";
-                g_connectionTasks.push_back({"Player " + std::to_string(i+1) + " — " + side + " JoyCon"});
-            } else if (pc.controllerType == DualJoyCon) {
-                g_connectionTasks.push_back({"Player " + std::to_string(i+1) + " — RIGHT JoyCon"});
-                g_connectionTasks.push_back({"Player " + std::to_string(i+1) + " — LEFT JoyCon"});
-            } else if (pc.controllerType == ProController) {
-                g_connectionTasks.push_back({"Player " + std::to_string(i+1) + " — Pro Controller"});
-            } else {
-                g_connectionTasks.push_back({"Player " + std::to_string(i+1) + " — NSO GC Controller"});
-            }
-        }
-        g_connectionTaskIndex = 0;
-        g_connectionDone      = false;
-        g_connectionError     = "";
-        g_screen = AppScreen::Connecting;
-
-        InitViGEm();
-        bool needsDsu = false;
-        for (auto& pc : g_playerConfigs) if (pc.gyroMode==GyroMode::DsuUdp) { needsDsu=true; break; }
-        if (needsDsu) g_dsuServer.Start();
-        if (g_opts.latencyMetrics)
-            g_latencyLogger.Start(g_opts.latencyCsvPath);
-
-        std::thread([configs = g_playerConfigs]() mutable {
-            int taskIdx = 0;
-
-            g_singlePlayers.clear();
-            g_dualPlayers.clear();
-            g_proPlayers.clear();
-
-            int dsuSlot = 0;
-            for (int pi = 0; pi < (int)configs.size(); ++pi) {
-                auto& pc = configs[pi];
-
-                if (pc.controllerType == SingleJoyCon) {
-                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
-                    bool ok = false;
-                    auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok);
-                    if (!ok) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
-                    g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (cj.writeChar) { SendCustomCommands(cj.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(cj.writeChar,0x01); EmitSound(cj.writeChar); }
-                    auto t = AddDS4();
-                    g_singlePlayers.push_back({ cj, t, pc.joyconSide, pc.joyconOrientation });
-                    auto& player = g_singlePlayers.back();
-                    if (pc.gyroMode==GyroMode::DsuUdp && g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
-                    AttachSingleJoyConHandler(player, pc.gyroMode, pc.motionProfile, dsuSlot);
-                    cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-                    AppLog("Player " + std::to_string(pi+1) + " Single JoyCon connected");
-                    ++taskIdx; ++dsuSlot;
-
-                } else if (pc.controllerType == DualJoyCon) {
-                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
-                    bool okR = false;
-                    auto rjc = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, okR);
-                    if (!okR) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
-                    g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (rjc.writeChar) { SendCustomCommands(rjc.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(rjc.writeChar,0x01); EmitSound(rjc.writeChar); }
-                    ++taskIdx;
-
-                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
-                    bool okL = false;
-                    auto ljc = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, okL);
-                    if (!okL) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
-                    g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (ljc.writeChar) { SendCustomCommands(ljc.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(ljc.writeChar,0x08); EmitSound(ljc.writeChar); }
-                    ++taskIdx;
-
-                    auto dp = std::make_unique<DualJoyConPlayer>();
-                    dp->leftJoyCon=ljc; dp->rightJoyCon=rjc;
-                    dp->gyroSource=pc.gyroSource; dp->gyroMode=pc.gyroMode;
-                    dp->motionProfile=pc.motionProfile; dp->dsuSlot=dsuSlot;
-                    dp->ds4Controller=AddDS4(); dp->running.store(true);
-                    dp->sharedState=std::make_shared<DualJoyConSharedState>();
-                    if (dp->gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
-                    auto ss=dp->sharedState;
-                    ljc.inputChar.ValueChanged([ss](GattCharacteristic const&, GattValueChangedEventArgs const& a){
-                        auto now=SteadyClock::now(); auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
-                        std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
-                        FeedCalibBuffer(buf, true);
-                        std::lock_guard<std::mutex> lk(ss->mutex);
-                        ss->left.bleDeltaMs=MsBetween(ss->lastLeftBleTime,now); ss->lastLeftBleTime=now;
-                        ss->left.buffer=std::move(buf); ss->left.receivedAt=now; ss->left.sequence=++ss->sequence;
-                        ss->cv.notify_one();
-                    });
-                    ljc.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-                    rjc.inputChar.ValueChanged([ss](GattCharacteristic const&, GattValueChangedEventArgs const& a){
-                        auto now=SteadyClock::now(); auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
-                        std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
-                        FeedCalibBuffer(buf, false);
-                        std::lock_guard<std::mutex> lk(ss->mutex);
-                        ss->right.bleDeltaMs=MsBetween(ss->lastRightBleTime,now); ss->lastRightBleTime=now;
-                        ss->right.buffer=std::move(buf); ss->right.receivedAt=now; ss->right.sequence=++ss->sequence;
-                        ss->cv.notify_one();
-                    });
-                    rjc.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-                    dp->updateThread=std::thread([dpptr=dp.get(),ss](){
-                        uint64_t lastSeq=0;
-                        while (dpptr->running.load(std::memory_order_acquire)) {
-                            TimedInputBuffer ls,rs;
-                            {
-                                std::unique_lock<std::mutex> lk(ss->mutex);
-                                ss->cv.wait_for(lk,std::chrono::milliseconds(1),[&]{ return !dpptr->running.load()||ss->sequence!=lastSeq; });
-                                if (!dpptr->running.load()) break;
-                                if (ss->left.buffer.empty()||ss->right.buffer.empty()||ss->sequence==lastSeq) continue;
-                                auto now=SteadyClock::now();
-                                if (!ShouldEmit(g_opts.updatePolicy,ss->lastEmitTime,now)){lastSeq=ss->sequence;continue;}
-                                ls=ss->left; rs=ss->right; lastSeq=ss->sequence;
-                            }
-                            MotionProfile mp=(dpptr->gyroMode==GyroMode::DsuUdp)?MotionProfile::Raw:dpptr->motionProfile;
-                            auto report=GenerateDualJoyConDS4Report(ls.buffer,rs.buffer,dpptr->gyroSource,mp);
-                            if (dpptr->gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) {
-                                auto dr=GenerateDualJoyConDS4Report(ls.buffer,rs.buffer,dpptr->gyroSource,MotionProfile::SwitchEmu);
-                                g_dsuServer.UpdateController(dpptr->dsuSlot,dr);
-                            }
-                            vigem_target_ds4_update_ex(g_vigem,dpptr->ds4Controller,report);
-                        }
-                    });
-                    g_dualPlayers.push_back(std::move(dp));
-                    AppLog("Player " + std::to_string(pi+1) + " Dual JoyCon connected");
-                    ++dsuSlot;
-
-                } else if (pc.controllerType == ProController) {
-                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
-                    bool ok = false;
-                    auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok);
-                    if (!ok) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
-                    g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (cj.writeChar) { SendCustomCommands(cj.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(cj.writeChar,0x01); EmitSound(cj.writeChar); }
-                    auto tgt=AddDS4();
-                    auto latPtr=std::make_shared<LatencyTracker>();
-                    auto gm=pc.gyroMode; auto mp=pc.motionProfile; uint8_t ds=(uint8_t)dsuSlot;
-                    cj.inputChar.ValueChanged([tgt,gm,mp,ds,latPtr](GattCharacteristic const&, GattValueChangedEventArgs const& a) mutable {
-                        auto now=SteadyClock::now(); auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
-                        std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
-                        FeedCalibBuffer(buf, g_calib.isLeft);
-                        double bd=MsBetween(latPtr->lastBleTime,now); latPtr->lastBleTime=now;
-                        if (!ShouldEmit(g_opts.updatePolicy,latPtr->lastEmitTime,SteadyClock::now())) return;
-                        auto ds4p=(gm==GyroMode::DsuUdp)?MotionProfile::Raw:mp;
-                        DS4_REPORT_EX report=GenerateProControllerReport(buf,ds4p);
-                        ApplyGLGR(report,buf); HandleSpecialProButtons(buf);
-                        if (gm==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) {
-                            DS4_REPORT_EX dr=GenerateProControllerReport(buf,MotionProfile::SwitchEmu);
-                            ApplyGLGR(dr,buf); g_dsuServer.UpdateController(ds,dr);
-                        }
-                        vigem_target_ds4_update_ex(g_vigem,tgt,report);
-                    });
-                    cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-                    if (pc.gyroMode==GyroMode::DsuUdp&&g_dsuServer.IsRunning()) g_dsuServer.SetControllerConnected(dsuSlot);
-                    g_proPlayers.push_back({cj,tgt});
-                    AppLog("Player " + std::to_string(pi+1) + " Pro Controller connected");
-                    ++taskIdx; ++dsuSlot;
-
-                } else {
-                    g_connectionTasks[taskIdx].statusMsg = "Scanning...";
-                    bool ok = false;
-                    auto cj = BleConnect([&](const std::string& s){ g_connectionTasks[taskIdx].statusMsg=s; }, ok);
-                    if (!ok) { g_connectionError="Failed: "+g_connectionTasks[taskIdx].label; g_connectionDone=true; return; }
-                    g_connectionTasks[taskIdx].done=true; g_connectionTasks[taskIdx].success=true;
-                    if (cj.writeChar) { SendCustomCommands(cj.writeChar); std::this_thread::sleep_for(std::chrono::milliseconds(200)); SetPlayerLEDs(cj.writeChar,0x01); EmitSound(cj.writeChar); }
-                    auto tgt=AddDS4();
-                    cj.inputChar.ValueChanged([tgt](GattCharacteristic const&, GattValueChangedEventArgs const& a) mutable {
-                        auto rdr=DataReader::FromBuffer(a.CharacteristicValue());
-                        std::vector<uint8_t> buf(rdr.UnconsumedBufferLength()); rdr.ReadBytes(buf);
-                        DS4_REPORT_EX report=GenerateNSOGCReport(buf);
-                        vigem_target_ds4_update_ex(g_vigem,tgt,report);
-                    });
-                    cj.inputChar.WriteClientCharacteristicConfigurationDescriptorAsync(GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
-                    g_proPlayers.push_back({cj,tgt});
-                    AppLog("Player " + std::to_string(pi+1) + " NSO GC connected");
-                    ++taskIdx; ++dsuSlot;
-                }
-            }
-            g_connectionDone = true;
-        }).detach();
-    }
-
+    DrawLog();
     ImGui::End();
 }
 
@@ -1112,173 +782,19 @@ static void DrawConnectingScreen() {
         ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove);
 
     ImGui::Spacing();
-    ImGui::SetCursorPosX((io.DisplaySize.x - ImGui::CalcTextSize("Connecting...").x)*0.5f);
-    ImGui::TextColored({0.4f,0.8f,1.f,1.f}, "Connecting...");
+    const char* title = "Connecting...";
+    ImGui::SetCursorPosX((io.DisplaySize.x - ImGui::CalcTextSize(title).x) * 0.5f);
+    ImGui::TextColored({0.4f,0.8f,1.f,1.f}, "%s", title);
     ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
 
-    if (!g_connectionError.empty()) {
-        ImGui::TextColored({1.f,0.3f,0.3f,1.f}, "Error: %s", g_connectionError.c_str());
-        ImGui::Spacing();
-        if (ImGui::Button("Back to Setup")) { g_connectionError=""; g_screen=AppScreen::Setup; }
-    } else {
-        for (auto& t : g_connectionTasks) {
-            if (t.done) {
-                ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "[OK] %s", t.label.c_str());
-            } else {
-                static float spin = 0.f; spin += ImGui::GetIO().DeltaTime * 3.f;
-                const char* spinners[] = {"|","/","-","\\"};
-                ImGui::TextColored({1.f,0.8f,0.2f,1.f}, "[%s] %s — %s",
-                    spinners[(int)(spin)%4], t.label.c_str(), t.statusMsg.c_str());
-                break;
-            }
-        }
+    static float spin = 0.f;
+    spin += ImGui::GetIO().DeltaTime * 3.f;
+    const char* spinners[] = {"|", "/", "-", "\\"};
+    ImGui::Text("[%s] Initializing Switch 2 Pro Controller over USB...", spinners[(int)(spin) % 4]);
+    ImGui::Spacing();
 
-        ImGui::Spacing();
-        if (g_connectionDone) {
-            ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "All controllers connected!");
-            ImGui::Spacing();
-            float bw=120;
-            ImGui::SetCursorPosX((io.DisplaySize.x-bw)*0.5f);
-            ImGui::PushStyleColor(ImGuiCol_Button,{0.2f,0.6f,0.2f,1.f});
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,{0.3f,0.75f,0.3f,1.f});
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,{0.15f,0.5f,0.15f,1.f});
-            if (ImGui::Button("Start!", {bw,36})) g_screen=AppScreen::Running;
-            ImGui::PopStyleColor(3);
-        }
-    }
+    DrawLog();
     ImGui::End();
-}
-
-static void DrawCalibWizard() {
-    if (!g_calib.active) return;
-    UpdateCalibLiveValues();
-
-    ImGui::OpenPopup("Stick Calibration Wizard");
-    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Always, {0.5f,0.5f});
-    ImGui::SetNextWindowSize({480,360}, ImGuiCond_Always);
-
-    if (ImGui::BeginPopupModal("Stick Calibration Wizard", &g_calib.active)) {
-        const char* stickName = g_calib.isLeft ? "Left Stick" : "Right Stick";
-        ImGui::TextColored({0.4f,0.8f,1.f,1.f}, "Calibrating: %s", stickName);
-        ImGui::Separator(); ImGui::Spacing();
-
-        ImGui::Text("Raw X: %4d   Raw Y: %4d", g_calib.rawX, g_calib.rawY);
-        ImGui::Spacing();
-
-        if (g_calib.step == 0) {
-            ImGui::TextWrapped("This wizard will calibrate your stick's center and range.\n\n"
-                               "Step 1: Release the stick and let it sit at rest. Then click Capture Center.");
-            ImGui::Spacing();
-            if (ImGui::Button("Capture Center", {160,32})) {
-                g_calib.centerX = g_calib.rawX;
-                g_calib.centerY = g_calib.rawY;
-                g_calib.step = 1;
-            }
-        } else if (g_calib.step == 1) {
-            ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "Center captured: %d, %d", g_calib.centerX, g_calib.centerY);
-            ImGui::Spacing();
-            ImGui::TextWrapped("Step 2: Slowly rotate the stick all the way around in a full circle to capture the extents.\n"
-                               "Click Start Capture, rotate, then click Done.");
-            ImGui::Spacing();
-            if (!g_calib.capturing) {
-                if (ImGui::Button("Start Capturing Extents", {200,32})) {
-                    g_calib.minX=4095; g_calib.maxX=0; g_calib.minY=4095; g_calib.maxY=0;
-                    g_calib.captureFrames=0; g_calib.capturing=true;
-                }
-            } else {
-                ImGui::TextColored({1.f,0.5f,0.1f,1.f}, "Capturing... rotate the stick fully!");
-                ImGui::Text("Frames: %d   MinX:%d MaxX:%d MinY:%d MaxY:%d",
-                    g_calib.captureFrames, g_calib.minX, g_calib.maxX, g_calib.minY, g_calib.maxY);
-                if (ImGui::Button("Done Rotating", {160,32})) {
-                    g_calib.capturing = false;
-                    g_calib.step = 2;
-                }
-            }
-        } else if (g_calib.step == 2) {
-            ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "Center: %d, %d", g_calib.centerX, g_calib.centerY);
-            ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "X Range: %d – %d", g_calib.minX, g_calib.maxX);
-            ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "Y Range: %d – %d", g_calib.minY, g_calib.maxY);
-            ImGui::Spacing();
-            ImGui::TextWrapped("Review the values above. Click Apply to save, or Redo to recapture.");
-            ImGui::Spacing();
-            if (ImGui::Button("Apply", {100,32})) {
-                if (g_calib.minX >= g_calib.maxX || g_calib.minY >= g_calib.maxY
-                    || g_calib.captureFrames < 10) {
-                    AppLog("Calibration failed: rotate the stick fully before applying.");
-                    g_calib.step = 1;
-                } else {
-                    CalibrationProfile updated = GetActiveCalibration();
-                    auto& sc = g_calib.isLeft ? updated.leftStick : updated.rightStick;
-                    sc.centerX = g_calib.centerX; sc.centerY = g_calib.centerY;
-                    sc.minX = g_calib.minX;       sc.maxX = g_calib.maxX;
-                    sc.minY = g_calib.minY;       sc.maxY = g_calib.maxY;
-                    int idx = GetActiveCalibrationIndex();
-                    DeleteCalibrationProfile(idx);
-                    AddCalibrationProfile(updated);
-                    SetActiveCalibrationIndex((int)GetCalibrationProfiles().size()-1);
-                    SaveCalibrationProfiles("calibration.json");
-                    AppLog(std::string("Calibration applied for ") + stickName);
-                    g_calib.active = false;
-                }
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Redo", {100,32})) { g_calib.step=0; }
-        }
-
-        ImGui::Spacing(); ImGui::Separator();
-        if (ImGui::Button("Cancel")) g_calib.active=false;
-        ImGui::EndPopup();
-    }
-}
-
-static void DrawLayoutManager() {
-    if (!g_showLayoutManager) return;
-    ImGui::OpenPopup("GL/GR Layout Manager");
-    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Always, {0.5f,0.5f});
-    ImGui::SetNextWindowSize({500,400}, ImGuiCond_Always);
-
-    if (ImGui::BeginPopupModal("GL/GR Layout Manager", &g_showLayoutManager)) {
-        ImGui::Text("Active: %s", g_proConfig.layouts[g_proConfig.activeLayoutIndex].name);
-        ImGui::Separator(); ImGui::Spacing();
-
-        for (int i = 0; i < (int)g_proConfig.layouts.size(); ++i) {
-            ImGui::PushID(i);
-            auto& lay = g_proConfig.layouts[i];
-            bool isActive = (i == g_proConfig.activeLayoutIndex);
-            if (isActive) ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.15f,0.3f,0.15f,1.f));
-            ImGui::BeginChild(ImGui::GetID("##lay"), {-1,80}, true);
-            ImGui::InputText("##name", lay.name, 64);
-            ImGui::SameLine();
-            if (isActive) ImGui::TextColored({0.3f,1.f,0.3f,1.f},"[ACTIVE]");
-            int gl=(int)lay.glMapping, gr=(int)lay.grMapping;
-            ImGui::SetNextItemWidth(140); ImGui::Combo("GL##g", &gl, BtnMapNames, 17); lay.glMapping=(ButtonMapping)gl;
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(140); ImGui::Combo("GR##r", &gr, BtnMapNames, 17); lay.grMapping=(ButtonMapping)gr;
-            ImGui::SameLine();
-            if (!isActive && ImGui::SmallButton("Set Active")) { g_proConfig.activeLayoutIndex=i; SaveProConfig(); }
-            ImGui::SameLine();
-            if (g_proConfig.layouts.size()>1 && ImGui::SmallButton("Del")) {
-                g_proConfig.layouts.erase(g_proConfig.layouts.begin()+i);
-                if (g_proConfig.activeLayoutIndex>=(int)g_proConfig.layouts.size())
-                    g_proConfig.activeLayoutIndex=(int)g_proConfig.layouts.size()-1;
-                SaveProConfig(); ImGui::EndChild(); if (isActive) ImGui::PopStyleColor(); ImGui::PopID(); break;
-            }
-            ImGui::EndChild();
-            if (isActive) ImGui::PopStyleColor();
-            ImGui::PopID();
-        }
-
-        ImGui::Spacing();
-        if (ImGui::Button("+ New Layout")) {
-            GLGRLayout nl; snprintf(nl.name,64,"Layout %d",(int)g_proConfig.layouts.size()+1);
-            g_proConfig.layouts.push_back(nl); SaveProConfig();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Close")) { g_showLayoutManager=false; SaveProConfig(); }
-        ImGui::EndPopup();
-    }
 }
 
 static void DrawRunningScreen() {
@@ -1287,116 +803,59 @@ static void DrawRunningScreen() {
     ImGui::Begin("##running", nullptr,
         ImGuiWindowFlags_NoTitleBar|ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoMove);
 
-    ImGui::TextColored({0.4f,0.8f,1.f,1.f}, "joycon2cpp — Running");
-    ImGui::SameLine(io.DisplaySize.x - 110);
-    ImGui::PushStyleColor(ImGuiCol_Button,{0.6f,0.2f,0.2f,1.f});
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,{0.75f,0.3f,0.3f,1.f});
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,{0.5f,0.15f,0.15f,1.f});
-    if (ImGui::Button("Disconnect & Exit", {80,0})) PostQuitMessage(0);
+    ImGui::TextColored({0.4f,0.8f,1.f,1.f}, "Switch 2 Pro Controller");
+    ImGui::SameLine(io.DisplaySize.x - 140.f);
+    ImGui::PushStyleColor(ImGuiCol_Button,        {0.6f,0.2f,0.2f,1.f});
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, {0.75f,0.3f,0.3f,1.f});
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  {0.5f,0.15f,0.15f,1.f});
+    if (ImGui::Button("Disconnect", {120, 0})) DoDisconnect();
     ImGui::PopStyleColor(3);
     ImGui::Separator(); ImGui::Spacing();
 
-    if (ImGui::CollapsingHeader("Connected Controllers", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Indent(10);
-        for (int i=0; i<(int)g_singlePlayers.size(); ++i) {
-            auto& p=g_singlePlayers[i];
-            ImGui::BulletText("Single JoyCon (%s, %s)",
-                p.side==JoyConSide::Left?"Left":"Right",
-                p.orientation==JoyConOrientation::Upright?"Upright":"Sideways");
-        }
-        for (int i=0; i<(int)g_dualPlayers.size(); ++i)
-            ImGui::BulletText("Dual JoyCon pair");
-        for (int i=0; i<(int)g_proPlayers.size(); ++i)
-            ImGui::BulletText("Pro / NSO GC Controller");
-        ImGui::Unindent(10); ImGui::Spacing();
-    }
-
-    if (ImGui::CollapsingHeader("Stick Calibration")) {
-        ImGui::Indent(10);
-        ImGui::TextDisabled("Connect a JoyCon first, then calibrate below.");
-        ImGui::Spacing();
-
-        bool hasAny = !g_singlePlayers.empty() || !g_dualPlayers.empty() || !g_proPlayers.empty();
-        if (!hasAny) {
-            ImGui::TextColored({1.f,0.6f,0.2f,1.f},"No controllers connected.");
-        } else {
-            ImGui::Text("Stick to calibrate:");
-            ImGui::SameLine();
-            if (ImGui::Button("Left Stick##cal")) ResetCalib(true);
-            ImGui::SameLine();
-            if (ImGui::Button("Right Stick##cal")) ResetCalib(false);
-        }
-
-        const auto& cal=GetActiveCalibration();
-        ImGui::Spacing();
-        ImGui::Text("Left:  center(%d,%d)  X[%d-%d]  Y[%d-%d]",
-            cal.leftStick.centerX,cal.leftStick.centerY,
-            cal.leftStick.minX,cal.leftStick.maxX,cal.leftStick.minY,cal.leftStick.maxY);
-        ImGui::Text("Right: center(%d,%d)  X[%d-%d]  Y[%d-%d]",
-            cal.rightStick.centerX,cal.rightStick.centerY,
-            cal.rightStick.minX,cal.rightStick.maxX,cal.rightStick.minY,cal.rightStick.maxY);
-        ImGui::Unindent(10); ImGui::Spacing();
-    }
-
-    bool hasProActive = !g_proPlayers.empty();
-    if (hasProActive && ImGui::CollapsingHeader("GL/GR Layouts")) {
-        ImGui::Indent(10);
-        ImGui::Text("Active: %s  (GL: %s, GR: %s)",
-            g_proConfig.layouts[g_proConfig.activeLayoutIndex].name,
-            BtnMapStr(g_proConfig.layouts[g_proConfig.activeLayoutIndex].glMapping),
-            BtnMapStr(g_proConfig.layouts[g_proConfig.activeLayoutIndex].grMapping));
-        ImGui::SameLine();
-        if (ImGui::Button("Manage Layouts")) g_showLayoutManager = true;
-        ImGui::SameLine();
-        if (ImGui::Button("Next Layout")) {
-            g_proConfig.activeLayoutIndex = (g_proConfig.activeLayoutIndex+1) % (int)g_proConfig.layouts.size();
-            SaveProConfig();
-        }
-        ImGui::Unindent(10); ImGui::Spacing();
-    }
+    if (g_statusMsg == "Connected!")
+        ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "Connected  —  emulating as Xbox 360 (XInput) via ViGEmBus");
+    else
+        ImGui::TextColored({1.f,0.8f,0.2f,1.f}, "%s", g_statusMsg.c_str());
+    if (g_dsuServer.IsRunning())
+        ImGui::TextColored({0.3f,1.f,0.3f,1.f}, "DSU Server active (UDP port 26760)");
+    ImGui::Spacing();
 
     if (ImGui::CollapsingHeader("Settings")) {
         ImGui::Indent(10);
-        const char* policies[]={"Low Latency","Balanced 120Hz","Legacy 60Hz"};
-        int pol=(int)g_opts.updatePolicy;
+        const char* policies[] = {"Low Latency", "Balanced 120 Hz", "Legacy 60 Hz"};
+        int pol = (int)g_updatePolicy;
         ImGui::SetNextItemWidth(200);
-        if (ImGui::Combo("Update Policy##run",&pol,policies,3))
-            g_opts.updatePolicy=(UpdatePolicy)pol;
+        if (ImGui::Combo("Update Policy##run", &pol, policies, 3))
+            g_updatePolicy = (UpdatePolicy)pol;
         ImGui::Unindent(10); ImGui::Spacing();
     }
 
-    if (ImGui::CollapsingHeader("Log", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::BeginChild("##log",{-1,150},true);
-        std::lock_guard<std::mutex> lk(g_logMutex);
-        for (auto& line : g_logLines) ImGui::TextUnformatted(line.c_str());
-        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
-            ImGui::SetScrollHereY(1.f);
-        ImGui::EndChild();
-    }
-
-    if (g_openLayoutManager.load()) { g_openLayoutManager.store(false); g_showLayoutManager=true; }
-
-    DrawCalibWizard();
-    DrawLayoutManager();
-
+    DrawLog();
     ImGui::End();
 }
 
+// ─── WinMain ─────────────────────────────────────────────────────────────────
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
-    init_apartment();
-    LoadProConfig();
+    AllocConsole();
+    FILE* dummy;
+    freopen_s(&dummy, "CONOUT$", "w", stdout);
+    freopen_s(&dummy, "CONOUT$", "w", stderr);
+    SetConsoleTitleW(L"Switch 2 Pro Controller — debug log");
+    printf("[INIT] Switch 2 Pro Controller starting (VID=057E PID=2069)\n");
+
     LoadCalibrationProfiles("calibration.json");
 
-    if (g_playerConfigs.empty()) g_playerConfigs.push_back({});
-
     WNDCLASSEXW wc{sizeof(WNDCLASSEXW), CS_CLASSDC, WndProc, 0L, 0L, hInst,
-                   nullptr, nullptr, nullptr, nullptr, L"joycon2cpp", nullptr};
+                   nullptr, nullptr, nullptr, nullptr, L"sw2proctl", nullptr};
     RegisterClassExW(&wc);
-    g_hwnd = CreateWindowW(L"joycon2cpp", L"joycon2cpp",
+    g_hwnd = CreateWindowW(L"sw2proctl", L"Switch 2 Pro Controller",
                            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                           900, 620, nullptr, nullptr, hInst, nullptr);
+                           740, 520, nullptr, nullptr, hInst, nullptr);
 
-    if (!CreateDX11(g_hwnd)) { DestroyWindow(g_hwnd); UnregisterClassW(wc.lpszClassName, hInst); return 1; }
+    if (!CreateDX11(g_hwnd)) {
+        DestroyWindow(g_hwnd); UnregisterClassW(wc.lpszClassName, hInst); return 1;
+    }
     ShowWindow(g_hwnd, SW_SHOWDEFAULT);
     UpdateWindow(g_hwnd);
 
@@ -1404,15 +863,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-
     ImGui::StyleColorsDark();
     auto& style = ImGui::GetStyle();
-    style.WindowRounding = 6.f;
-    style.FrameRounding  = 4.f;
-    style.GrabRounding   = 4.f;
+    style.WindowRounding  = 6.f;
+    style.FrameRounding   = 4.f;
+    style.GrabRounding    = 4.f;
     style.WindowBorderSize = 0.f;
-    style.Colors[ImGuiCol_WindowBg] = {0.08f,0.08f,0.10f,1.f};
-    style.Colors[ImGuiCol_Header]   = {0.18f,0.35f,0.55f,1.f};
+    style.Colors[ImGuiCol_WindowBg] = {0.08f, 0.08f, 0.10f, 1.f};
+    style.Colors[ImGuiCol_Header]   = {0.18f, 0.35f, 0.55f, 1.f};
 
     ImGui_ImplWin32_Init(g_hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
@@ -1437,24 +895,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
         }
 
         ImGui::Render();
-        const float cc[4] = {0.06f,0.06f,0.08f,1.f};
+        const float cc[4] = {0.06f, 0.06f, 0.08f, 1.f};
         g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRTV, nullptr);
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRTV, cc);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         g_pSwapChain->Present(1, 0);
     }
 
-    for (auto& dp : g_dualPlayers) {
-        dp->running.store(false);
-        if (dp->sharedState) dp->sharedState->cv.notify_all();
-        if (dp->updateThread.joinable()) dp->updateThread.join();
-        vigem_target_remove(g_vigem, dp->ds4Controller);
-        vigem_target_free(dp->ds4Controller);
-    }
-    for (auto& sp : g_singlePlayers) { vigem_target_remove(g_vigem,sp.ds4Controller); vigem_target_free(sp.ds4Controller); }
-    for (auto& pp : g_proPlayers)    { vigem_target_remove(g_vigem,pp.ds4Controller); vigem_target_free(pp.ds4Controller); }
-    if (g_vigem) { vigem_disconnect(g_vigem); vigem_free(g_vigem); g_vigem=nullptr; }
-    g_dsuServer.Stop();
+    DoDisconnect();
+    if (g_vigem) { vigem_disconnect(g_vigem); vigem_free(g_vigem); g_vigem = nullptr; }
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

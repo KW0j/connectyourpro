@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>connectyourpro — Switch Pro Controller on PC</title>
+<meta name="description" content="Free, open-source Windows tool that makes the Nintendo Switch 2 Pro Controller (and the original Pro Controller) work on PC as an Xbox 360 or DualShock 4 pad. One click, no browser tricks.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0b0d12; --surface:#131720; --surface2:#181d29; --line:#232a38;
+  --text:#e9ecf2; --dim:#8a91a0; --red:#e63b3b; --red-soft:#ff5c5c; --green:#3dc96b;
+  --disp:"Chakra Petch",system-ui,sans-serif;
+  --body:system-ui,"Segoe UI",Roboto,sans-serif;
+  --mono:"JetBrains Mono",Consolas,monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:var(--body);line-height:1.6;overflow-x:hidden}
+a{color:inherit;text-decoration:none}
+::selection{background:var(--red);color:#fff}
+
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+
+/* ── nav ── */
+nav{position:sticky;top:0;z-index:50;background:rgba(11,13,18,.82);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.nav-in{display:flex;align-items:center;justify-content:space-between;height:64px}
+.logo{font-family:var(--disp);font-weight:700;font-size:1.25rem;letter-spacing:-.02em}
+.logo b{color:var(--red);font-weight:700}
+.nav-links{display:flex;gap:28px;align-items:center;font-size:.92rem;color:var(--dim)}
+.nav-links a:hover{color:var(--text)}
+.btn{display:inline-block;font-family:var(--disp);font-weight:600;letter-spacing:.02em;
+  background:var(--red);color:#fff;padding:10px 22px;border-radius:8px;transition:transform .15s,background .15s}
+.btn:hover{background:var(--red-soft);transform:translateY(-1px)}
+.btn.small{padding:8px 16px;font-size:.88rem}
+.btn.ghost{background:transparent;border:1px solid var(--line);color:var(--text)}
+.btn.ghost:hover{border-color:var(--dim);background:var(--surface)}
+@media(max-width:720px){.nav-links a:not(.btn){display:none}}
+
+/* ── hero ── */
+.hero{padding:88px 0 64px;position:relative}
+.hero-grid{display:grid;grid-template-columns:1.05fr .95fr;gap:48px;align-items:center}
+@media(max-width:860px){.hero-grid{grid-template-columns:1fr}}
+.hero h1{font-family:var(--disp);font-weight:700;font-size:clamp(2.1rem,4.6vw,3.3rem);line-height:1.12;letter-spacing:-.02em}
+.hero h1 .pro{color:var(--red)}
+.hero p.lead{color:var(--dim);font-size:1.12rem;margin:20px 0 30px;max-width:34rem}
+.hero .cta-row{display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+.hero .meta{margin-top:18px;font-size:.86rem;color:var(--dim)}
+.hero .meta span{margin-right:16px}
+.hero .meta i{color:var(--green);font-style:normal}
+
+/* hex ticker — the activation sequence the console normally sends */
+.hexline{margin-top:44px;overflow:hidden;white-space:nowrap;font-family:var(--mono);font-size:.72rem;color:#39415280;
+  mask-image:linear-gradient(90deg,transparent,#000 12%,#000 88%,transparent)}
+.hexline span{display:inline-block;animation:tick 40s linear infinite;padding-right:40px}
+@keyframes tick{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+
+/* ── controller schematic ── */
+.padbox{position:relative}
+.padbox svg{width:100%;height:auto;display:block}
+.padbox .caption{text-align:center;font-family:var(--mono);font-size:.72rem;letter-spacing:.14em;color:var(--dim);margin-top:14px}
+.padbox .caption i{color:var(--green);font-style:normal}
+.pbtn{fill:var(--surface2);stroke:#39415a;stroke-width:1.5;transition:fill .18s,stroke .18s}
+.pbtn.lit{fill:var(--green);stroke:#fff}
+.plabel{font-family:var(--disp);font-size:13px;font-weight:600;fill:var(--text);pointer-events:none;transition:fill .18s}
+.plabel.lit{fill:#08150c}
+.pbody{fill:var(--surface);stroke:var(--line);stroke-width:1.5}
+.pknob{fill:#2a3040;transition:fill .18s}
+.pknob.lit{fill:var(--green)}
+
+/* ── sections ── */
+section{padding:76px 0}
+.eyebrow{font-family:var(--mono);font-size:.74rem;letter-spacing:.2em;color:var(--red);text-transform:uppercase;margin-bottom:14px}
+h2{font-family:var(--disp);font-weight:600;font-size:clamp(1.5rem,3vw,2.1rem);letter-spacing:-.01em;margin-bottom:16px}
+.sub{color:var(--dim);max-width:40rem}
+
+/* why */
+.why{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:var(--surface)}
+.why-grid{display:grid;grid-template-columns:1fr 1fr;gap:40px;align-items:center}
+@media(max-width:760px){.why-grid{grid-template-columns:1fr}}
+.why .mono-card{background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:22px;font-family:var(--mono);font-size:.82rem;color:var(--dim);line-height:2}
+.why .mono-card .ok{color:var(--green)}
+.why .mono-card .bad{color:var(--red-soft)}
+
+/* features */
+.feat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:36px}
+@media(max-width:860px){.feat-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:560px){.feat-grid{grid-template-columns:1fr}}
+.feat{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:24px;transition:transform .18s,border-color .18s}
+.feat:hover{transform:translateY(-3px);border-color:#3a4356}
+.feat h3{font-family:var(--disp);font-weight:600;font-size:1.02rem;margin-bottom:8px}
+.feat p{font-size:.9rem;color:var(--dim)}
+.feat .tag{display:inline-block;font-family:var(--mono);font-size:.66rem;letter-spacing:.1em;color:var(--green);border:1px solid #2c5c3d;border-radius:99px;padding:2px 9px;margin-bottom:12px}
+.feat .tag.exp{color:#f0a848;border-color:#6b4a1e}
+
+/* steps — a real sequence: install, connect, play */
+.steps{counter-reset:step}
+.step{display:grid;grid-template-columns:64px 1fr;gap:20px;padding:26px 0;border-bottom:1px solid var(--line)}
+.step:last-child{border-bottom:none}
+.step .n{counter-increment:step;font-family:var(--disp);font-weight:700;font-size:1.9rem;color:var(--red)}
+.step .n::before{content:counter(step,decimal-leading-zero)}
+.step h3{font-family:var(--disp);font-weight:600;margin-bottom:6px}
+.step p{color:var(--dim);font-size:.94rem;max-width:44rem}
+.step code{font-family:var(--mono);font-size:.84em;background:var(--surface2);border:1px solid var(--line);border-radius:5px;padding:1px 7px}
+
+/* screenshots */
+.shots{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:36px}
+@media(max-width:720px){.shots{grid-template-columns:1fr}}
+.shot{aspect-ratio:16/10;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:var(--surface)}
+.shot img{width:100%;height:100%;object-fit:cover;display:block}
+.shot .ph{width:100%;height:100%;display:flex;flex-direction:column;gap:8px;align-items:center;justify-content:center;color:#4a5266;font-family:var(--mono);font-size:.78rem;border:2px dashed var(--line);border-radius:12px}
+
+/* faq */
+.faq details{border-bottom:1px solid var(--line)}
+.faq summary{cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:center;padding:20px 4px;font-family:var(--disp);font-weight:600;font-size:1rem}
+.faq summary::-webkit-details-marker{display:none}
+.faq summary::after{content:"+";font-family:var(--mono);color:var(--red);font-size:1.2rem;transition:transform .2s}
+.faq details[open] summary::after{transform:rotate(45deg)}
+.faq .a{padding:0 4px 22px;color:var(--dim);font-size:.94rem;max-width:46rem}
+
+/* download band */
+.band{background:linear-gradient(180deg,var(--surface),var(--bg));border-top:1px solid var(--line);text-align:center}
+.band .btn{font-size:1.05rem;padding:14px 34px}
+.band .note{margin-top:14px;font-size:.84rem;color:var(--dim)}
+
+/* footer */
+footer{border-top:1px solid var(--line);padding:44px 0 56px;font-size:.84rem;color:var(--dim)}
+.foot-grid{display:grid;grid-template-columns:1.2fr 1fr;gap:32px}
+@media(max-width:720px){.foot-grid{grid-template-columns:1fr}}
+footer h4{font-family:var(--disp);color:var(--text);font-size:.92rem;margin-bottom:10px}
+footer a{color:#aab1c0;border-bottom:1px solid transparent}
+footer a:hover{color:var(--text);border-color:var(--dim)}
+footer .legal{margin-top:28px;padding-top:20px;border-top:1px solid var(--line);font-size:.78rem;color:#5b6272}
+
+/* reveal on scroll */
+.rv{opacity:0;transform:translateY(18px);transition:opacity .6s ease,transform .6s ease}
+.rv.in{opacity:1;transform:none}
+@media(prefers-reduced-motion:reduce){
+  .rv{opacity:1;transform:none;transition:none}
+  .hexline span{animation:none}
+  *{scroll-behavior:auto}
+}
+a:focus-visible,summary:focus-visible,.btn:focus-visible{outline:2px solid var(--red);outline-offset:3px;border-radius:6px}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap nav-in">
+    <a class="logo" href="#">connectyour<b>pro</b></a>
+    <div class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#how">How it works</a>
+      <a href="#faq">FAQ</a>
+      <a href="https://github.com/KW0jtowicz/connectyourpro">GitHub</a>
+      <a class="btn small" href="https://github.com/KW0jtowicz/connectyourpro/releases/latest">Download</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="hero-grid">
+      <div>
+        <h1>Your Switch Pro Controller,<br>working on PC <span class="pro">in one click.</span></h1>
+        <p class="lead">The Switch 2 Pro Controller does nothing when you plug it into a PC —
+        it waits for a secret handshake only the console sends. connectyourpro sends it for you
+        and turns the pad into an Xbox 360 or DualShock 4 controller every game understands.</p>
+        <div class="cta-row">
+          <a class="btn" href="https://github.com/KW0jtowicz/connectyourpro/releases/latest">Download for Windows</a>
+          <a class="btn ghost" href="https://github.com/KW0jtowicz/connectyourpro">View source</a>
+        </div>
+        <div class="meta">
+          <span><i>●</i> Free &amp; open source</span>
+          <span>Windows 10 / 11</span>
+          <span>Pro Controller 1 &amp; 2</span>
+        </div>
+      </div>
+
+      <div class="padbox rv in" aria-hidden="true">
+        <!-- schematic mirrors the app's live test view -->
+        <svg viewBox="0 0 560 260">
+          <rect class="pbody" x="30" y="48" width="500" height="190" rx="60"/>
+          <rect class="pbtn" data-k="LB" x="80"  y="12" width="120" height="28" rx="9"/>
+          <text class="plabel" data-k="LB" x="140" y="31" text-anchor="middle">L</text>
+          <rect class="pbtn" data-k="RB" x="360" y="12" width="120" height="28" rx="9"/>
+          <text class="plabel" data-k="RB" x="420" y="31" text-anchor="middle">R</text>
+          <circle class="pbtn" data-k="MIN" cx="246" cy="87" r="13"/>
+          <text class="plabel" data-k="MIN" x="246" y="92" text-anchor="middle">−</text>
+          <circle class="pbtn" data-k="PLU" cx="314" cy="87" r="13"/>
+          <text class="plabel" data-k="PLU" x="314" y="92" text-anchor="middle">+</text>
+          <circle class="pbtn" data-k="LS" cx="133" cy="113" r="33"/>
+          <circle class="pknob" data-k="LSK" cx="133" cy="113" r="12"/>
+          <circle class="pbtn" data-k="RS" cx="341" cy="171" r="29"/>
+          <circle class="pknob" data-k="RSK" cx="341" cy="171" r="10"/>
+          <g>
+            <rect class="pbtn" data-k="DU" x="203" y="140" width="24" height="32" rx="5"/>
+            <rect class="pbtn" data-k="DD" x="203" y="172" width="24" height="32" rx="5"/>
+            <rect class="pbtn" data-k="DL" x="183" y="160" width="24" height="24" rx="5"/>
+            <rect class="pbtn" data-k="DR" x="223" y="160" width="24" height="24" rx="5"/>
+          </g>
+          <circle class="pbtn" data-k="X" cx="430" cy="79"  r="17"/>
+          <text class="plabel" data-k="X" x="430" y="84" text-anchor="middle">X</text>
+          <circle class="pbtn" data-k="A" cx="462" cy="111" r="17"/>
+          <text class="plabel" data-k="A" x="462" y="116" text-anchor="middle">A</text>
+          <circle class="pbtn" data-k="B" cx="430" cy="143" r="17"/>
+          <text class="plabel" data-k="B" x="430" y="148" text-anchor="middle">B</text>
+          <circle class="pbtn" data-k="Y" cx="398" cy="111" r="17"/>
+          <text class="plabel" data-k="Y" x="398" y="116" text-anchor="middle">Y</text>
+        </svg>
+        <div class="caption"><i>●</i> LIVE TEST VIEW — EVERY PRESS LIGHTS UP IN THE APP</div>
+      </div>
+    </div>
+
+    <div class="hexline" aria-hidden="true"><span id="hex"></span></div>
+  </div>
+</header>
+
+<section class="why">
+  <div class="wrap why-grid">
+    <div class="rv">
+      <div class="eyebrow">The problem</div>
+      <h2>Windows can't wake it up. We can.</h2>
+      <p class="sub">On the console, the Switch 2 Pro Controller receives a proprietary
+      activation sequence before it starts reporting input. A PC never sends it, so the pad
+      just sits there. connectyourpro opens the controller's hidden USB interface, replays the
+      exact activation handshake, then translates every report into a virtual Xbox 360 or
+      DualShock 4 pad — the two controller types PC games actually support.</p>
+    </div>
+    <div class="mono-card rv" aria-hidden="true">
+      <div><span class="bad">×</span> plug in pad&nbsp;&nbsp;→ windows: silence</div>
+      <div><span class="ok">✓</span> connectyourpro → 0x03 0x91 0x00 0x0d…</div>
+      <div><span class="ok">✓</span> controller → input stream @ 4 ms</div>
+      <div><span class="ok">✓</span> games see → xbox 360 / ds4 pad</div>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <div class="eyebrow rv">Features</div>
+    <h2 class="rv">Everything between the pad and your game</h2>
+    <div class="feat-grid">
+      <div class="feat rv"><span class="tag">CORE</span>
+        <h3>Automatic activation</h3>
+        <p>The full activation sequence is built in and runs on Connect. No browser, no
+        procon2tool tab, no manual steps.</p></div>
+      <div class="feat rv"><span class="tag">OUTPUT</span>
+        <h3>XInput or DualShock 4</h3>
+        <p>Show up in games as an Xbox 360 pad (works everywhere, including Forza) or a DS4.
+        Switchable inside the app.</p></div>
+      <div class="feat rv"><span class="tag">TEST</span>
+        <h3>Live test view</h3>
+        <p>A schematic of your controller where every press lights up and the sticks move in
+        real time. Know it works before the game starts.</p></div>
+      <div class="feat rv"><span class="tag">REMAP</span>
+        <h3>Click-to-remap</h3>
+        <p>Click any button on the schematic and pick what it outputs. One-click preset for the
+        Nintendo A/B–X/Y swap.</p></div>
+      <div class="feat rv"><span class="tag">MOTION</span>
+        <h3>DSU gyro server</h3>
+        <p>Streams motion data over the Cemuhook protocol for Dolphin, Cemu and other emulators.
+        Toggle it on the fly.</p></div>
+      <div class="feat rv"><span class="tag exp">USB + BT</span>
+        <h3>Cable or wireless</h3>
+        <p>USB for the lowest latency. Bluetooth supported for both pads — experimental on the
+        Pro Controller 2.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="how" class="why">
+  <div class="wrap">
+    <div class="eyebrow rv">How it works</div>
+    <h2 class="rv">Three steps, about a minute</h2>
+    <div class="steps" style="margin-top:26px">
+      <div class="step rv"><div class="n"></div><div>
+        <h3>Install</h3>
+        <p>Run the installer. It also sets up the <a href="https://github.com/nefarius/ViGEmBus">ViGEmBus</a>
+        driver — the piece of Windows plumbing that makes virtual gamepads possible — if you
+        don't have it yet.</p></div></div>
+      <div class="step rv"><div class="n"></div><div>
+        <h3>Connect</h3>
+        <p>Pick your controller (Pro Controller 2 or 1), connection (USB or Bluetooth) and
+        output type, then press <code>Connect</code>. USB: just plug the cable in.
+        Bluetooth on ProCon 2: hold the SYNC button until the LEDs sweep — no Windows pairing needed.</p></div></div>
+      <div class="step rv"><div class="n"></div><div>
+        <h3>Play</h3>
+        <p>Your games see a regular Xbox 360 or DS4 controller. Test buttons on the live
+        schematic, remap if you like, and jump in.</p></div></div>
+    </div>
+  </div>
+</section>
+
+<section id="shots">
+  <div class="wrap">
+    <div class="eyebrow rv">Screenshots</div>
+    <h2 class="rv">Clean by design</h2>
+    <div class="shots">
+      <div class="shot rv"><div class="ph"><span>[ screenshot ]</span><span>setup — controller &amp; output picker</span></div></div>
+      <div class="shot rv"><div class="ph"><span>[ screenshot ]</span><span>dashboard — live test view &amp; remap</span></div></div>
+    </div>
+  </div>
+</section>
+
+<section id="faq" class="why">
+  <div class="wrap">
+    <div class="eyebrow rv">FAQ</div>
+    <h2 class="rv">Before you ask</h2>
+    <div class="faq rv" style="margin-top:10px">
+      <details>
+        <summary>Windows' game controller panel shows my Pro Controller flashing randomly.</summary>
+        <div class="a">That entry is the <em>physical</em> controller. After activation it speaks a
+        protocol Windows doesn't understand, so the built-in test panel shows noise. Games use the
+        virtual <strong>Xbox 360 Controller</strong> created by connectyourpro — test that one instead.</div>
+      </details>
+      <details>
+        <summary>The controller suddenly refuses to connect.</summary>
+        <div class="a">Nintendo's controllers have a built-in cooldown: too many connection attempts
+        in a short time and they go quiet for a few minutes. Wait a moment and try again — it recovers
+        on its own.</div>
+      </details>
+      <details>
+        <summary>Is Bluetooth as good as USB?</summary>
+        <div class="a">On the Pro Controller 2, not yet — the Windows Bluetooth LE stack adds noticeable
+        input lag, which is why the app marks it as experimental. Use USB for fast-paced games. The
+        original Pro Controller works well on both.</div>
+      </details>
+      <details>
+        <summary>Does it work with Steam?</summary>
+        <div class="a">Yes. Steam sees the virtual Xbox 360 / DS4 pad like any other controller, and
+        Steam Input features work as usual.</div>
+      </details>
+      <details>
+        <summary>Is it safe? Why does it need a driver?</summary>
+        <div class="a">The whole project is open source (MIT) — you can read every line on GitHub or
+        build it yourself. The bundled ViGEmBus driver is the same signed, widely-used driver that
+        powers DS4Windows and similar tools; it's required because only a driver can create a
+        controller that games recognize system-wide.</div>
+      </details>
+      <details>
+        <summary>Is this affiliated with Nintendo?</summary>
+        <div class="a">No. This is an independent, free community project. Nintendo Switch and
+        Pro Controller are trademarks of Nintendo.</div>
+      </details>
+    </div>
+  </div>
+</section>
+
+<section class="band">
+  <div class="wrap rv">
+    <h2>Plug it in. Press Connect. Play.</h2>
+    <a class="btn" href="https://github.com/KW0jtowicz/connectyourpro/releases/latest" style="margin-top:18px">Download connectyourpro</a>
+    <div class="note">Free forever · MIT licensed · If it saved your evening, a donation is always appreciated</div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-grid">
+      <div>
+        <div class="logo" style="margin-bottom:10px">connectyour<b>pro</b></div>
+        <p>A free, open-source bridge between Nintendo Switch Pro Controllers and PC games.
+        Built on the shoulders of the community.</p>
+      </div>
+      <div>
+        <h4>Credits &amp; links</h4>
+        <p>
+          <a href="https://github.com/KW0jtowicz/connectyourpro">Source code</a> ·
+          <a href="https://github.com/KW0jtowicz/connectyourpro/releases/latest">Releases</a><br>
+          Fork of <a href="https://github.com/TheFrano/joycon2cpp">joycon2cpp</a> by TheFrano ·
+          Activation research by <a href="https://handheldlegend.github.io/procon2tool/">HandheldLegend</a>
+          and <a href="https://github.com/german77">german77</a><br>
+          <a href="https://github.com/nefarius/ViGEmBus">ViGEmBus</a> by Nefarius ·
+          UI: <a href="https://github.com/ocornut/imgui">Dear ImGui</a>
+        </p>
+      </div>
+    </div>
+    <div class="legal">
+      © 2026 connectyourpro contributors · Original joycon2cpp © 2025 Frano · Released under the
+      MIT License. This project is not affiliated with, endorsed by, or sponsored by Nintendo.
+      Nintendo Switch and Pro Controller are trademarks of Nintendo. All other trademarks belong
+      to their respective owners.
+    </div>
+  </div>
+</footer>
+
+<script>
+// hex ticker: the actual first bytes of the activation sequence, doubled for a seamless loop
+(function(){
+  var seq="0x03 0x91 0x00 0x0d 0x00 0x08 0x00 0x00 0x01 0x00 · 0x07 0x91 0x00 0x01 · 0x16 0x91 0x00 0x01 · 0x15 0x91 0x00 0x01 0x00 0x0e · 0x15 0x91 0x00 0x02 0x00 0x11 · 0x09 0x91 0x00 0x07 · 0x0c 0x91 0x00 0x02 · 0x11 0x91 0x00 0x03 · 0x0a 0x91 0x00 0x08 · handshake accepted — input stream @ 4 ms · ";
+  document.getElementById("hex").textContent=seq+seq;
+})();
+
+// controller schematic: buttons light up in a demo sequence (like the app's test view)
+(function(){
+  if(matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  var order=["A","B","X","Y","LB","RB","DU","DR","DD","DL","MIN","PLU","LS","RS"];
+  var i=0;
+  function lit(k,on){
+    document.querySelectorAll('[data-k="'+k+'"]').forEach(function(el){
+      el.classList.toggle("lit",on);
+    });
+    if(k==="LS") document.querySelectorAll('[data-k="LSK"]').forEach(function(e){e.classList.toggle("lit",on);});
+    if(k==="RS") document.querySelectorAll('[data-k="RSK"]').forEach(function(e){e.classList.toggle("lit",on);});
+  }
+  setInterval(function(){
+    var k=order[i];
+    lit(k,true);
+    setTimeout(function(){lit(k,false);},380);
+    i=(i+1)%order.length;
+  },560);
+  // idle stick wiggle
+  var t=0;
+  setInterval(function(){
+    t+=.09;
+    var lk=document.querySelector('[data-k="LSK"]'), rk=document.querySelector('[data-k="RSK"]');
+    if(lk){lk.setAttribute("cx",133+Math.cos(t)*7);lk.setAttribute("cy",113+Math.sin(t*1.3)*7);}
+    if(rk){rk.setAttribute("cx",341+Math.sin(t*.8)*6);rk.setAttribute("cy",171+Math.cos(t*1.1)*6);}
+  },50);
+})();
+
+// scroll reveals
+(function(){
+  var io=new IntersectionObserver(function(es){
+    es.forEach(function(e){ if(e.isIntersecting){ e.target.classList.add("in"); io.unobserve(e.target);} });
+  },{threshold:.12});
+  document.querySelectorAll(".rv").forEach(function(el){ io.observe(el); });
+})();
+</script>
+</body>
+</html>

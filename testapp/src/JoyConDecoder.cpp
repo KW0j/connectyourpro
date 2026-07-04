@@ -714,6 +714,208 @@ DS4_REPORT_EX GenerateNSOGCReport(const std::vector<uint8_t>& buffer)
     return report;
 }
 
+DS4_REPORT_EX GenerateSwitch2ProReport(const std::vector<uint8_t>& buffer, MotionProfile profile)
+{
+    DS4_REPORT_EX report{};
+    DS4_REPORT_INIT(reinterpret_cast<PDS4_REPORT>(&report.Report));
+
+    // Report 0x09 layout (Switch 2 Pro Controller USB HID):
+    // [0]=0x09  [1]=seq  [2]=flags
+    // [3]=buttons1  [4]=buttons2  [5]=buttons3
+    // [6-8]=left stick 12-bit ×2  [9-11]=right stick 12-bit ×2
+    if (buffer.size() < 12) return report;
+
+    uint8_t b1 = buffer[3]; // B A Y X  R ZR Plus RStick
+    uint8_t b2 = buffer[4]; // Down Right Left Up  L ZL Minus LStick
+    uint8_t b3 = buffer[5]; // Home Capture RPaddle LPaddle
+
+    // Face buttons: Nintendo → DS4
+    if (b1 & 0x01) report.Report.wButtons |= DS4_BUTTON_CROSS;         // B
+    if (b1 & 0x02) report.Report.wButtons |= DS4_BUTTON_CIRCLE;        // A
+    if (b1 & 0x04) report.Report.wButtons |= DS4_BUTTON_SQUARE;        // Y
+    if (b1 & 0x08) report.Report.wButtons |= DS4_BUTTON_TRIANGLE;      // X
+    if (b1 & 0x10) report.Report.wButtons |= DS4_BUTTON_SHOULDER_RIGHT;// R
+    if (b1 & 0x20) { report.Report.bTriggerR = 255; report.Report.wButtons |= DS4_BUTTON_TRIGGER_RIGHT; } // ZR
+    if (b1 & 0x40) report.Report.wButtons |= DS4_BUTTON_OPTIONS;       // Plus
+    if (b1 & 0x80) report.Report.wButtons |= DS4_BUTTON_THUMB_RIGHT;   // RStick
+    if (b2 & 0x10) report.Report.wButtons |= DS4_BUTTON_SHOULDER_LEFT; // L
+    if (b2 & 0x20) { report.Report.bTriggerL = 255; report.Report.wButtons |= DS4_BUTTON_TRIGGER_LEFT; } // ZL
+    if (b2 & 0x40) report.Report.wButtons |= DS4_BUTTON_SHARE;         // Minus
+    if (b2 & 0x80) report.Report.wButtons |= DS4_BUTTON_THUMB_LEFT;    // LStick
+    if (b3 & 0x01) report.Report.bSpecial |= DS4_SPECIAL_BUTTON_PS;       // Home
+    if (b3 & 0x02) report.Report.bSpecial |= DS4_SPECIAL_BUTTON_TOUCHPAD; // Capture
+
+    // D-Pad
+    bool dUp    = (b2 & 0x08) != 0;
+    bool dDown  = (b2 & 0x01) != 0;
+    bool dLeft  = (b2 & 0x04) != 0;
+    bool dRight = (b2 & 0x02) != 0;
+    uint8_t dpad = DS4_BUTTON_DPAD_NONE;
+    if      (dUp   && dLeft)  dpad = DS4_BUTTON_DPAD_NORTHWEST;
+    else if (dUp   && dRight) dpad = DS4_BUTTON_DPAD_NORTHEAST;
+    else if (dDown && dLeft)  dpad = DS4_BUTTON_DPAD_SOUTHWEST;
+    else if (dDown && dRight) dpad = DS4_BUTTON_DPAD_SOUTHEAST;
+    else if (dUp)             dpad = DS4_BUTTON_DPAD_NORTH;
+    else if (dDown)           dpad = DS4_BUTTON_DPAD_SOUTH;
+    else if (dLeft)           dpad = DS4_BUTTON_DPAD_WEST;
+    else if (dRight)          dpad = DS4_BUTTON_DPAD_EAST;
+    DS4_SET_DPAD(reinterpret_cast<PDS4_REPORT>(&report.Report), static_cast<DS4_DPAD_DIRECTIONS>(dpad));
+
+    // Sticks: 12-bit packed, center ~2048, range 0-4095
+    auto decodeStick12 = [](uint8_t b0, uint8_t b1, uint8_t b2,
+                             const StickCalibration& cal) -> std::pair<int16_t, int16_t>
+    {
+        int x = b0 | ((b1 & 0x0F) << 8);
+        int y = ((b1 & 0xF0) >> 4) | (b2 << 4);
+        float fx = ApplyCalibratedAxis(x, cal.centerX, cal.minX, cal.maxX);
+        float fy = ApplyCalibratedAxis(y, cal.centerY, cal.minY, cal.maxY);
+        constexpr float dz = 0.05f;
+        if (std::abs(fx) < dz && std::abs(fy) < dz) return {0, 0};
+        fx = std::clamp(fx * 1.5f, -1.0f, 1.0f);
+        fy = std::clamp(fy * 1.5f, -1.0f, 1.0f);
+        return {static_cast<int16_t>(fx * 32767), static_cast<int16_t>(-fy * 32767)};
+    };
+
+    const auto& cal = GetActiveCalibration();
+    auto [lx, ly] = decodeStick12(buffer[6], buffer[7], buffer[8], cal.leftStick);
+    auto [rx, ry] = decodeStick12(buffer[9], buffer[10], buffer[11], cal.rightStick);
+
+    report.Report.bThumbLX = static_cast<uint8_t>((lx / 32767.0f) * 127 + 128);
+    report.Report.bThumbLY = static_cast<uint8_t>((ly / 32767.0f) * 127 + 128);
+    report.Report.bThumbRX = static_cast<uint8_t>((rx / 32767.0f) * 127 + 128);
+    report.Report.bThumbRY = static_cast<uint8_t>((ry / 32767.0f) * 127 + 128);
+
+    return report;
+}
+
+XUSB_REPORT GenerateSwitch2ProXboxReport(const std::vector<uint8_t>& buffer)
+{
+    XUSB_REPORT r{};
+    XUSB_REPORT_INIT(&r);
+
+    if (buffer.size() < 12) return r;
+
+    uint8_t b1 = buffer[3]; // B A Y X  R ZR Plus RStick
+    uint8_t b2 = buffer[4]; // Down Right Left Up  L ZL Minus LStick
+    uint8_t b3 = buffer[5]; // Home Capture RPaddle LPaddle
+
+    // Face buttons: Switch 2 → Xbox 360
+    // Nintendo layout: B=bottom, A=right, Y=left, X=top
+    // Xbox layout:     A=bottom, B=right, X=left, Y=top
+    if (b1 & 0x02) r.wButtons |= XUSB_GAMEPAD_A;              // A → A
+    if (b1 & 0x01) r.wButtons |= XUSB_GAMEPAD_B;              // B → B
+    if (b1 & 0x08) r.wButtons |= XUSB_GAMEPAD_X;              // X → X
+    if (b1 & 0x04) r.wButtons |= XUSB_GAMEPAD_Y;              // Y → Y
+    if (b1 & 0x10) r.wButtons |= XUSB_GAMEPAD_RIGHT_SHOULDER; // R
+    if (b1 & 0x20) r.bRightTrigger = 255;                     // ZR
+    if (b1 & 0x40) r.wButtons |= XUSB_GAMEPAD_START;          // Plus
+    if (b1 & 0x80) r.wButtons |= XUSB_GAMEPAD_RIGHT_THUMB;    // RStick
+
+    if (b2 & 0x01) r.wButtons |= XUSB_GAMEPAD_DPAD_DOWN;      // Down
+    if (b2 & 0x02) r.wButtons |= XUSB_GAMEPAD_DPAD_RIGHT;     // Right
+    if (b2 & 0x04) r.wButtons |= XUSB_GAMEPAD_DPAD_LEFT;      // Left
+    if (b2 & 0x08) r.wButtons |= XUSB_GAMEPAD_DPAD_UP;        // Up
+    if (b2 & 0x10) r.wButtons |= XUSB_GAMEPAD_LEFT_SHOULDER;  // L
+    if (b2 & 0x20) r.bLeftTrigger = 255;                      // ZL
+    if (b2 & 0x40) r.wButtons |= XUSB_GAMEPAD_BACK;           // Minus
+    if (b2 & 0x80) r.wButtons |= XUSB_GAMEPAD_LEFT_THUMB;     // LStick
+
+    // Home → not mapped (XUSB_GAMEPAD_GUIDE triggers Xbox overlay and breaks games)
+
+    // Sticks: 12-bit (0-4095, center ~2048) → Xbox SHORT (-32768..32767)
+    // Circular deadzone: apply on vector magnitude, not per-axis.
+    // This gives uniform coverage regardless of octagonal gate shape.
+    constexpr float STICK_DZ    = 0.10f; // 10% — absorbs LY drift (~9%) and wear
+    constexpr float STICK_BOOST = 1.40f; // slightly more to fully reach edges after DZ rescale
+
+    auto decodeStick = [&](
+        uint8_t xb0, uint8_t xb1,
+        uint8_t yb1, uint8_t yb2,
+        const StickCalibration& cal) -> std::pair<SHORT, SHORT>
+    {
+        int rawX = xb0 | ((xb1 & 0x0F) << 8);
+        int rawY = ((yb1 & 0xF0) >> 4) | (yb2 << 4);
+        float fx = ApplyCalibratedAxis(rawX, cal.centerX, cal.minX, cal.maxX);
+        float fy = ApplyCalibratedAxis(rawY, cal.centerY, cal.minY, cal.maxY);
+
+        float mag = std::sqrt(fx * fx + fy * fy);
+        if (mag < STICK_DZ) return { 0, 0 };
+
+        float newMag = std::clamp((mag - STICK_DZ) / (1.0f - STICK_DZ) * STICK_BOOST, 0.0f, 1.0f);
+        float scale = newMag / mag;
+        return {
+            static_cast<SHORT>(fx * scale * 32767.0f),
+            static_cast<SHORT>(fy * scale * 32767.0f)
+        };
+    };
+
+    const auto& cal = GetActiveCalibration();
+    auto [lx, ly] = decodeStick(buffer[6], buffer[7], buffer[7], buffer[8],   cal.leftStick);
+    auto [rx, ry] = decodeStick(buffer[9], buffer[10], buffer[10], buffer[11], cal.rightStick);
+    r.sThumbLX = lx;
+    r.sThumbLY = ly;
+    r.sThumbRX = rx;
+    r.sThumbRY = ry;
+
+    return r;
+}
+
+XUSB_REPORT GenerateProControllerXboxReport(const std::vector<uint8_t>& buffer)
+{
+    XUSB_REPORT r{};
+    XUSB_REPORT_INIT(&r);
+    if (buffer.size() < 0x10) return r;
+
+    // 0x30 report: buf[3..8] = 48-bit button state (same layout as GenerateProControllerReport)
+    uint64_t state = 0;
+    for (int i = 3; i <= 8; ++i) state = (state << 8) | buffer[i];
+
+    // Face buttons: A=A, B=B, X=X, Y=Y (Nintendo name matches Xbox name here)
+    if (state & BUTTON_A_MASK)     r.wButtons |= XUSB_GAMEPAD_A;
+    if (state & BUTTON_B_MASK)     r.wButtons |= XUSB_GAMEPAD_B;
+    if (state & BUTTON_X_MASK)     r.wButtons |= XUSB_GAMEPAD_X;
+    if (state & BUTTON_Y_MASK)     r.wButtons |= XUSB_GAMEPAD_Y;
+    if (state & BUTTON_R_SHOULDER) r.wButtons |= XUSB_GAMEPAD_RIGHT_SHOULDER;
+    if (state & BUTTON_L_SHOULDER) r.wButtons |= XUSB_GAMEPAD_LEFT_SHOULDER;
+    if (state & TRIGGER_RT_MASK)   r.bRightTrigger = 255;
+    if (state & TRIGGER_LT_MASK)   r.bLeftTrigger  = 255;
+    if (state & BUTTON_START)      r.wButtons |= XUSB_GAMEPAD_START;
+    if (state & BUTTON_BACK)       r.wButtons |= XUSB_GAMEPAD_BACK;
+    if (state & BUTTON_R_THUMB)    r.wButtons |= XUSB_GAMEPAD_RIGHT_THUMB;
+    if (state & BUTTON_L_THUMB)    r.wButtons |= XUSB_GAMEPAD_LEFT_THUMB;
+    if (state & BUTTON_DPAD_UP)    r.wButtons |= XUSB_GAMEPAD_DPAD_UP;
+    if (state & BUTTON_DPAD_DOWN)  r.wButtons |= XUSB_GAMEPAD_DPAD_DOWN;
+    if (state & BUTTON_DPAD_LEFT)  r.wButtons |= XUSB_GAMEPAD_DPAD_LEFT;
+    if (state & BUTTON_DPAD_RIGHT) r.wButtons |= XUSB_GAMEPAD_DPAD_RIGHT;
+    // Home → not mapped (avoids Xbox overlay)
+
+    // Sticks: 0x30 format, buf[10-12]=left, buf[13-15]=right
+    // Nintendo 0x30 convention: pushing UP → raw increases → positive ly
+    // Xbox: positive sThumbLY = UP → NO negation needed (opposite of DS4!)
+    if (buffer.size() < 16) return r;
+
+    constexpr float DZ    = 0.10f;
+    constexpr float BOOST = 1.35f;
+    auto applyDZ = [&](int16_t v) -> int16_t {
+        float f = v / 32767.0f;
+        if (std::abs(f) < DZ) return 0;
+        float sign = f > 0.0f ? 1.0f : -1.0f;
+        return static_cast<int16_t>(
+            sign * std::clamp((std::abs(f) - DZ) / (1.0f - DZ) * BOOST, 0.0f, 1.0f) * 32767.0f);
+    };
+
+    const auto& cal = GetActiveCalibration();
+    auto [lx, ly] = decode_calibrated_stick(&buffer[10], cal.leftStick);
+    auto [rx, ry] = decode_calibrated_stick(&buffer[13], cal.rightStick);
+
+    r.sThumbLX =  applyDZ(lx);
+    r.sThumbLY =  applyDZ(ly);   // no Y negation for 0x30 → Xbox
+    r.sThumbRX =  applyDZ(rx);
+    r.sThumbRY =  applyDZ(ry);
+
+    return r;
+}
+
 uint32_t ExtractButtonState(const std::vector<uint8_t>& buffer)
 {
     if (buffer.size() < 6) return 0;

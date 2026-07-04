@@ -1,5 +1,8 @@
 build/
 .claude/
 .vscode/
-docs/
 HOW_TO.md
+build_log.txt
+installer/Output/
+installer/redist/
+*.ini
