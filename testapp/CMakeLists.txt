@@ -63,6 +63,7 @@ target_link_libraries(testapp
         hid
         winusb
         shell32
+        winmm
         ViGEmClient
         windowsapp
         ws2_32

@@ -14,6 +14,7 @@
 
 #define NOMINMAX
 #include <Windows.h>
+#include <mmsystem.h>
 extern "C" {
 #include <hidsdi.h>
 #include <hidpi.h>
@@ -92,6 +93,23 @@ static std::thread       g_readThread;
 static std::string       g_connectError;
 static std::string       g_statusMsg = "Ready.";
 static InputSource       g_inputSource = InputSource::None;
+
+// Rumble: motor state written by ViGEm callbacks, consumed by the rumble thread
+static bool                 g_rumbleEnabled = true;   // persisted setting
+static std::atomic<uint8_t> g_rumbleLarge{0};
+static std::atomic<uint8_t> g_rumbleSmall{0};
+static std::thread          g_rumbleThread;
+
+// Battery voltage in mV, read from BLE input reports (0 = unknown)
+static std::atomic<int>     g_batteryMv{0};
+
+// Windows 10's BLE stack caps notification polling around ~20 Hz (Win11: ~70 Hz)
+static bool IsWindows11OrNewer() {
+    typedef LONG(WINAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+    RTL_OSVERSIONINFOW v{}; v.dwOSVersionInfoSize = sizeof(v);
+    auto f = (RtlGetVersionPtr)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    return f && f(&v) == 0 && v.dwBuildNumber >= 22000;
+}
 
 static ImFont* g_fontBig = nullptr;
 
@@ -209,6 +227,7 @@ static void SaveSettings() {
     f << "conn="   << (int)g_connMode << "\n";
     f << "target=" << (int)g_target   << "\n";
     f << "dsu="    << (g_dsuEnabled ? 1 : 0) << "\n";
+    f << "rumble=" << (g_rumbleEnabled ? 1 : 0) << "\n";
     f << "remap=";
     for (int i = 0; i < LB_COUNT; i++) f << g_remap[i] << (i + 1 < LB_COUNT ? "," : "\n");
 }
@@ -226,6 +245,7 @@ static void LoadSettings() {
             else if (k == "conn")   g_connMode   = (ConnectionMode)std::clamp(std::stoi(v), 0, 1);
             else if (k == "target") g_target     = (EmulationTarget)std::clamp(std::stoi(v), 0, 1);
             else if (k == "dsu")    g_dsuEnabled = (v == "1");
+            else if (k == "rumble") g_rumbleEnabled = (v == "1");
             else if (k == "remap") {
                 std::stringstream ss(v);
                 std::string tok;
@@ -247,9 +267,10 @@ static BYTE                    g_pipeOut      = 0;
 
 // WinUSB-bound HID interface (MI_00 with Zadig/WinUSB driver) — interrupt pipes.
 // When Windows' HID stack doesn't own MI_00, input reports arrive here instead.
-static HANDLE                  g_rawFile   = INVALID_HANDLE_VALUE;
-static WINUSB_INTERFACE_HANDLE g_rawDev    = nullptr;
-static BYTE                    g_rawPipeIn = 0;
+static HANDLE                  g_rawFile    = INVALID_HANDLE_VALUE;
+static WINUSB_INTERFACE_HANDLE g_rawDev     = nullptr;
+static BYTE                    g_rawPipeIn  = 0;
+static BYTE                    g_rawPipeOut = 0;   // interrupt OUT (haptics), 0 if absent
 
 // ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -307,20 +328,20 @@ static bool FindBulkPipes(WINUSB_INTERFACE_HANDLE iface, BYTE& pipeIn, BYTE& pip
     return pipeIn != 0 && pipeOut != 0;
 }
 
-// Locate an interrupt IN pipe (HID-style interface bound to WinUSB).
-static bool FindInterruptInPipe(WINUSB_INTERFACE_HANDLE iface, BYTE& pipeIn) {
+// Locate interrupt pipes (HID-style interface bound to WinUSB).
+// Returns true when an interrupt IN exists; OUT is optional (used for haptics).
+static bool FindInterruptPipes(WINUSB_INTERFACE_HANDLE iface, BYTE& pipeIn, BYTE& pipeOut) {
     USB_INTERFACE_DESCRIPTOR ifDesc = {};
     if (!WinUsb_QueryInterfaceSettings(iface, 0, &ifDesc)) return false;
-    pipeIn = 0;
+    pipeIn = 0; pipeOut = 0;
     for (BYTE e = 0; e < ifDesc.bNumEndpoints; e++) {
         WINUSB_PIPE_INFORMATION pipe = {};
         if (!WinUsb_QueryPipe(iface, 0, e, &pipe)) continue;
-        if (pipe.PipeType == UsbdPipeTypeInterrupt && (pipe.PipeId & 0x80)) {
-            pipeIn = pipe.PipeId;
-            return true;
-        }
+        if (pipe.PipeType != UsbdPipeTypeInterrupt) continue;
+        if (pipe.PipeId & 0x80) pipeIn = pipe.PipeId;
+        else                    pipeOut = pipe.PipeId;
     }
-    return false;
+    return pipeIn != 0;
 }
 
 // Try to open one device path as the vendor bulk interface.
@@ -366,10 +387,10 @@ static bool TryOpenVendorPath(const char* path) {
     // Case 3: HID interface (MI_00) taken over by WinUSB/Zadig — has an
     // interrupt IN pipe. Windows HID won't see it, so input reports must be
     // read from here. Keep it as the raw-HID input candidate.
-    BYTE intIn = 0;
-    if (g_rawDev == nullptr && FindInterruptInPipe(dev, intIn)) {
+    BYTE intIn = 0, intOut = 0;
+    if (g_rawDev == nullptr && FindInterruptPipes(dev, intIn, intOut)) {
         AppLog("[USB] Interrupt IN pipe found — keeping as raw HID input source (WinUSB driver on HID interface)");
-        g_rawFile = h; g_rawDev = dev; g_rawPipeIn = intIn;
+        g_rawFile = h; g_rawDev = dev; g_rawPipeIn = intIn; g_rawPipeOut = intOut;
         return false; // keep searching for the vendor bulk interface
     }
 
@@ -480,7 +501,7 @@ static void CloseVendorInterface() {
 
     if (g_rawDev) { WinUsb_Free(g_rawDev); g_rawDev = nullptr; }
     if (g_rawFile != INVALID_HANDLE_VALUE) { CloseHandle(g_rawFile); g_rawFile = INVALID_HANDLE_VALUE; }
-    g_rawPipeIn = 0;
+    g_rawPipeIn = g_rawPipeOut = 0;
 }
 
 // ─── procon2tool initialization sequence (built-in "step 1") ─────────────────
@@ -703,10 +724,13 @@ constexpr uint16_t NINTENDO_MFG_ID = 1363;
 static const std::vector<uint8_t> NINTENDO_MFG_PREFIX = {0x01, 0x00, 0x03, 0x7E};
 static const wchar_t* BLE_INPUT_UUID = L"ab7de9be-89fe-49ad-828f-118f09df7fd2";
 static const wchar_t* BLE_WRITE_UUID = L"649d4ac9-8eb7-4e6c-af44-1ea54fe5f005";
+// Pro Controller 2 vibration characteristic (protocol research: Switch2Connect)
+static const wchar_t* BLE_VIB_UUID   = L"cc483f51-9258-427d-a939-630c31f72b05";
 
 static WBT::BluetoothLEDevice  g_bleDevice{nullptr};
 static WGA::GattCharacteristic g_bleInput{nullptr};
 static WGA::GattCharacteristic g_bleWrite{nullptr};
+static WGA::GattCharacteristic g_bleVib{nullptr};
 static winrt::event_token      g_bleToken{};
 static std::atomic<bool>       g_bleNeutralSent{false};
 
@@ -765,13 +789,14 @@ static bool BleConnect() {
         return false;
     }
 
-    WGA::GattCharacteristic inputCh{nullptr}, writeCh{nullptr};
+    WGA::GattCharacteristic inputCh{nullptr}, writeCh{nullptr}, vibCh{nullptr};
     for (auto svc : sr.Services()) {
         auto cr = svc.GetCharacteristicsAsync().get();
         if (cr.Status() != WGA::GattCommunicationStatus::Success) continue;
         for (auto ch : cr.Characteristics()) {
             if (ch.Uuid() == winrt::guid(BLE_INPUT_UUID)) inputCh = ch;
             if (ch.Uuid() == winrt::guid(BLE_WRITE_UUID)) writeCh = ch;
+            if (ch.Uuid() == winrt::guid(BLE_VIB_UUID))   vibCh   = ch;
         }
     }
     if (!inputCh || !writeCh) {
@@ -787,6 +812,9 @@ static bool BleConnect() {
     g_bleDevice = device;
     g_bleInput  = inputCh;
     g_bleWrite  = writeCh;
+    g_bleVib    = vibCh;
+    AppLog(vibCh ? "[BLE] Vibration characteristic found — rumble available"
+                 : "[BLE] Vibration characteristic not found — rumble disabled");
     setStatus("Bluetooth connected!");
     return true;
 }
@@ -817,8 +845,126 @@ static void BleDisconnect() {
     try { if (g_bleDevice) g_bleDevice.Close(); } catch (...) {}
     g_bleInput  = nullptr;
     g_bleWrite  = nullptr;
+    g_bleVib    = nullptr;
     g_bleDevice = nullptr;
     g_bleToken  = {};
+}
+
+// ─── Rumble (virtual pad → controller haptics) ──────────────────────────────
+//
+// Switch 2 haptic frame: 40-bit little-endian value packed into 5 bytes
+// (encoding from Switch2Connect's VibrationData):
+//   bits 0-8   low-band frequency   (default 0x0E1)
+//   bit  9     low-band tone enable
+//   bits 10-19 low-band amplitude   (0..0x3FF)  ← Xbox "large" motor
+//   bits 20-28 high-band frequency  (default 0x1E1)
+//   bit  29    high-band tone enable
+//   bits 30-39 high-band amplitude  (0..0x3FF)  ← Xbox "small" motor
+
+static void EncodeHapticFrame(uint8_t lgMotor, uint8_t smMotor, uint8_t out[5]) {
+    auto amp10 = [](uint8_t v) -> uint64_t {
+        return (uint64_t)((v / 255.0f) * 0x3FF) & 0x3FF;
+    };
+    uint64_t val = 0;
+    val |= (uint64_t)0x0E1;                 // LF frequency
+    val |= amp10(lgMotor) << 10;            // LF amplitude
+    val |= (uint64_t)0x1E1 << 20;           // HF frequency
+    val |= amp10(smMotor) << 30;            // HF amplitude
+    for (int i = 0; i < 5; i++) out[i] = (uint8_t)((val >> (8 * i)) & 0xFF);
+}
+
+// Send one haptic frame over whichever transport is active.
+static bool SendHaptic(const uint8_t frame[5], uint8_t counter) {
+    // USB HID output report 0x02 (procon2tool format): counter+frame twice
+    uint8_t rep[64] = {0};
+    rep[0]  = 0x02;
+    rep[1]  = 0x50 | (counter & 0x0F);
+    memcpy(&rep[2], frame, 5);
+    rep[17] = rep[1];
+    memcpy(&rep[18], frame, 5);
+
+    switch (g_inputSource) {
+    case InputSource::Hid: {
+        if (g_hidDevice == INVALID_HANDLE_VALUE) return false;
+        DWORD len = std::max((USHORT)64, g_hidOutputReportLen);
+        std::vector<uint8_t> buf(rep, rep + 64);
+        buf.resize(len, 0);
+        OVERLAPPED ov = {}; ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        BOOL ok = WriteFile(g_hidDevice, buf.data(), len, nullptr, &ov);
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            DWORD d = 0; ok = GetOverlappedResult(g_hidDevice, &ov, &d, TRUE);
+        }
+        CloseHandle(ov.hEvent);
+        return ok != FALSE;
+    }
+    case InputSource::RawHid: {
+        if (!g_rawDev) return false;
+        if (g_rawPipeOut) {   // interrupt OUT if the interface has one
+            ULONG w = 0;
+            return WinUsb_WritePipe(g_rawDev, g_rawPipeOut, rep, 64, &w, nullptr) != FALSE;
+        }
+        // fall back to HID SET_REPORT over the control pipe
+        WINUSB_SETUP_PACKET sp = {};
+        sp.RequestType = 0x21;      // host→device, class, interface
+        sp.Request     = 0x09;      // SET_REPORT
+        sp.Value       = 0x0202;    // output report, id 0x02
+        sp.Index       = 0;
+        sp.Length      = 64;
+        ULONG w = 0;
+        return WinUsb_ControlTransfer(g_rawDev, sp, rep, 64, &w, nullptr) != FALSE;
+    }
+    case InputSource::Ble: {
+        if (!g_bleVib) return false;
+        // BLE payload: 0x00 + [counter | frame x3] for left motor, same for right
+        try {
+            uint8_t block[16];
+            block[0] = 0x50 | (counter & 0x0F);
+            memcpy(&block[1],  frame, 5);
+            memcpy(&block[6],  frame, 5);
+            memcpy(&block[11], frame, 5);
+            std::vector<uint8_t> payload;
+            payload.push_back(0x00);
+            payload.insert(payload.end(), block, block + 16);
+            payload.insert(payload.end(), block, block + 16);
+            WSS::DataWriter w;
+            w.WriteBytes(payload);
+            g_bleVib.WriteValueAsync(w.DetachBuffer(), WGA::GattWriteOption::WriteWithoutResponse).get();
+            return true;
+        } catch (...) { return false; }
+    }
+    default:
+        return false;   // bulk mode: no known haptic path
+    }
+}
+
+// Background thread: keeps re-sending the current rumble state (the controller
+// needs a steady stream while vibrating) and sends one stop frame on release.
+static void RumbleLoop() {
+    AppLog("[RUMBLE] Thread started");
+    uint8_t ctr = 0;
+    bool wasActive = false;
+    int failLog = 0;
+    while (g_running.load(std::memory_order_acquire)) {
+        const uint8_t L = g_rumbleLarge.load(std::memory_order_relaxed);
+        const uint8_t S = g_rumbleSmall.load(std::memory_order_relaxed);
+        const bool on = g_rumbleEnabled &&
+                        g_model == ControllerModel::ProCon2 &&   // ProCon1 uses a different (HD rumble) encoding
+                        (L || S);
+        if (on) {
+            uint8_t f[5];
+            EncodeHapticFrame(L, S, f);
+            if (!SendHaptic(f, ctr++) && failLog++ < 3)
+                AppLog("[RUMBLE] send failed (transport does not accept haptics?)");
+            wasActive = true;
+        } else if (wasActive) {
+            uint8_t zero[5] = {0};
+            SendHaptic(zero, ctr++);
+            wasActive = false;
+        }
+        Sleep(15);
+    }
+    if (wasActive) { uint8_t zero[5] = {0}; SendHaptic(zero, ctr); }
+    AppLog("[RUMBLE] Thread stopped");
 }
 
 // ─── ProCon1 (Switch 1) 0x30 report decoding ─────────────────────────────────
@@ -1085,17 +1231,46 @@ static PVIGEM_TARGET AddVirtualPad() {
     return t;
 }
 
+// Rumble callbacks — the virtual pad tells us what the game wants
+static VOID CALLBACK X360RumbleCb(PVIGEM_CLIENT, PVIGEM_TARGET, UCHAR lgMotor, UCHAR smMotor, UCHAR, LPVOID) {
+    g_rumbleLarge.store(lgMotor, std::memory_order_relaxed);
+    g_rumbleSmall.store(smMotor, std::memory_order_relaxed);
+}
+static VOID CALLBACK Ds4RumbleCb(PVIGEM_CLIENT, PVIGEM_TARGET, UCHAR lgMotor, UCHAR smMotor, DS4_LIGHTBAR_COLOR, LPVOID) {
+    g_rumbleLarge.store(lgMotor, std::memory_order_relaxed);
+    g_rumbleSmall.store(smMotor, std::memory_order_relaxed);
+}
+
+#pragma warning(push)
+#pragma warning(disable: 4996)   // register_notification is deprecated but fits our needs
+static void RegisterRumble(PVIGEM_TARGET t) {
+    if (!t || !g_vigem) return;
+    if (g_target == EmulationTarget::DualShock4)
+        vigem_target_ds4_register_notification(g_vigem, t, Ds4RumbleCb, nullptr);
+    else
+        vigem_target_x360_register_notification(g_vigem, t, X360RumbleCb, nullptr);
+}
+static void UnregisterRumble(PVIGEM_TARGET t) {
+    if (!t) return;
+    vigem_target_x360_unregister_notification(t);
+    vigem_target_ds4_unregister_notification(t);
+    g_rumbleLarge.store(0); g_rumbleSmall.store(0);
+}
+#pragma warning(pop)
+
 // Swap the virtual pad type while connected (XInput <-> DualShock 4).
 static void SwitchTargetLive(EmulationTarget t) {
     std::lock_guard<std::mutex> lk(g_padMutex);
     if (t == g_target && g_pad) return;
     if (g_pad && g_vigem) {
+        UnregisterRumble(g_pad);
         vigem_target_remove(g_vigem, g_pad);
         vigem_target_free(g_pad);
         g_pad = nullptr;
     }
     g_target = t;
     g_pad = AddVirtualPad();
+    RegisterRumble(g_pad);
     SaveSettings();
     AppLog(t == EmulationTarget::DualShock4
         ? "[VIGEM] Switched output to DualShock 4"
@@ -1143,11 +1318,13 @@ static void DoConnect() {
                     g_screen = AppScreen::Setup;
                     return;
                 }
+                RegisterRumble(g_pad);
                 if (g_dsuEnabled) {
                     g_dsuServer.Start();
                     g_dsuServer.SetControllerConnected(0);
                 }
 
+                g_batteryMv.store(0);
                 g_emulationOn.store(true);
                 g_bleNeutralSent.store(false);
                 g_running.store(true, std::memory_order_release);
@@ -1160,6 +1337,9 @@ static void DoConnect() {
                         std::vector<uint8_t> buf(rdr.UnconsumedBufferLength());
                         rdr.ReadBytes(buf);
                         if (buf.size() < 0x3C) return;
+
+                        // Battery voltage lives at bytes 31-32 (mV, little-endian)
+                        g_batteryMv.store(buf[31] | (buf[32] << 8), std::memory_order_relaxed);
 
                         const bool emuOn = g_emulationOn.load(std::memory_order_relaxed);
                         std::lock_guard<std::mutex> padLk(g_padMutex);
@@ -1191,6 +1371,7 @@ static void DoConnect() {
                 g_bleInput.WriteClientCharacteristicConfigurationDescriptorAsync(
                     WGA::GattClientCharacteristicConfigurationDescriptorValue::Notify).get();
 
+                g_rumbleThread = std::thread(RumbleLoop);
                 g_statusMsg = "Connected via Bluetooth.";
                 AppLog("[CONNECT] Controller running (Bluetooth)!");
                 g_screen = AppScreen::Running;
@@ -1280,6 +1461,7 @@ static void DoConnect() {
             CloseVendorInterface();
             g_screen = AppScreen::Setup; return;
         }
+        RegisterRumble(g_pad);
 
         if (g_dsuEnabled) {
             g_dsuServer.Start();
@@ -1300,9 +1482,11 @@ static void DoConnect() {
                 g_statusMsg = "Connected — bulk mode (vendor pipe).";
                 break;
         }
+        g_batteryMv.store(0);
         g_emulationOn.store(true);
         g_running.store(true, std::memory_order_release);
-        g_readThread = std::thread(ReadLoop, hDev, g_vigem, g_pad);
+        g_readThread   = std::thread(ReadLoop, hDev, g_vigem, g_pad);
+        g_rumbleThread = std::thread(RumbleLoop);
 
         AppLog("[CONNECT] Controller running!");
         g_screen = AppScreen::Running;
@@ -1311,6 +1495,7 @@ static void DoConnect() {
 
 static void DoDisconnect() {
     g_running.store(false, std::memory_order_release);
+    if (g_rumbleThread.joinable()) g_rumbleThread.join();   // before transports close
     if (g_inputSource == InputSource::Ble)
         BleDisconnect();
     if (g_inputSource == InputSource::Bulk && g_usbIface)
@@ -1330,6 +1515,7 @@ static void DoDisconnect() {
     {
         std::lock_guard<std::mutex> lk(g_padMutex);
         if (g_pad && g_vigem) {
+            UnregisterRumble(g_pad);
             vigem_target_remove(g_vigem, g_pad);
             vigem_target_free(g_pad);
             g_pad = nullptr;
@@ -1337,6 +1523,7 @@ static void DoDisconnect() {
     }
     g_dsuServer.Stop();
     g_inputSource = InputSource::None;
+    g_batteryMv.store(0);
     ClearLive();
     SaveSettings();
     AppLog("[CONNECT] Disconnected");
@@ -1703,6 +1890,11 @@ static void DrawSetupScreen() {
         ImGui::TextColored(ui::ORANGE,
             "Experimental: Pro Controller 2 over Bluetooth has noticeably higher input lag "
             "than USB. Use a cable for fast-paced games.");
+        static const bool win11 = IsWindows11OrNewer();
+        if (!win11)
+            ImGui::TextColored(ui::ORANGE,
+                "Windows 10 detected: the OS caps Bluetooth LE polling at ~20 Hz, so wireless "
+                "will feel sluggish here. Windows 11 (~70 Hz) or USB is strongly recommended.");
         ImGui::PopTextWrapPos();
     }
 
@@ -1811,10 +2003,18 @@ static void DrawRunningScreen() {
     ImGui::SetCursorPosX(16);
     ImGui::TextColored(ui::TEXT_DIM, "%s", g_statusMsg.c_str());
     ImGui::SetCursorPosX(16);
-    ImGui::TextColored(ui::TEXT_DIM, "%s (%s)%s",
-        g_model  == ControllerModel::ProCon2 ? "Pro Controller 2" : "Pro Controller 1",
-        g_connMode == ConnectionMode::Bluetooth ? "Bluetooth" : "USB",
-        g_dsuServer.IsRunning() ? "   |   DSU on :26760" : "");
+    {
+        std::string info = std::string(g_model == ControllerModel::ProCon2 ? "Pro Controller 2" : "Pro Controller 1")
+                         + " (" + (g_connMode == ConnectionMode::Bluetooth ? "Bluetooth" : "USB") + ")";
+        int mv = g_batteryMv.load();
+        if (mv > 1000) {
+            int pct = std::clamp((mv - 3300) * 100 / 850, 0, 100);
+            char b[48]; snprintf(b, sizeof(b), "   |   Battery ~%d%% (%.2fV)", pct, mv / 1000.0);
+            info += b;
+        }
+        if (g_dsuServer.IsRunning()) info += "   |   DSU on :26760";
+        ImGui::TextColored(ui::TEXT_DIM, "%s", info.c_str());
+    }
 
     // Emulation on/off
     ImGui::SetCursorPos({ui::g_colW - 82.f, 16.f});
@@ -1843,7 +2043,7 @@ static void DrawRunningScreen() {
     ImGui::PopStyleColor();
     ImGui::Spacing();
 
-    // DSU on/off — works on the fly
+    // DSU + rumble — both work on the fly
     {
         bool dsu = g_dsuEnabled;
         if (ImGui::Checkbox("DSU server (gyro for emulators)", &dsu)) {
@@ -1852,6 +2052,11 @@ static void DrawRunningScreen() {
             if (dsu) { g_dsuServer.Start(); g_dsuServer.SetControllerConnected(0); }
             else       g_dsuServer.Stop();
         }
+        ImGui::SameLine(0, 24);
+        bool rum = g_rumbleEnabled;
+        if (ImGui::Checkbox("Rumble", &rum)) { g_rumbleEnabled = rum; SaveSettings(); }
+        if (g_model == ControllerModel::ProCon1 && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Rumble currently works on Pro Controller 2 only");
     }
     ImGui::Spacing();
 
@@ -1883,6 +2088,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     freopen_s(&dummy, "CONOUT$", "w", stderr);
     SetConsoleTitleW(L"connectyourpro — debug log");
     printf("[INIT] connectyourpro (built-in procon2tool init)\n");
+
+    // Scheduling quick wins: 1ms timer resolution + high priority reduce
+    // input-path jitter (same trick Switch2Connect uses)
+    timeBeginPeriod(1);
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
 
     LoadCalibrationProfiles("calibration.json");
     LoadSettings();
@@ -1977,5 +2187,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     CleanupDX11();
     DestroyWindow(g_hwnd);
     UnregisterClassW(wc.lpszClassName, hInst);
+    timeEndPeriod(1);
     return 0;
 }

@@ -155,7 +155,9 @@ a:focus-visible,.btn:focus-visible{outline:2px solid var(--red);outline-offset:3
 <section id="bluetooth">
   <h2>Switch 2 Pro Controller over Bluetooth</h2>
   <p>Bluetooth on the ProCon 2 is <strong>experimental</strong>: expect noticeably more input lag
-  than USB, because the controller talks Bluetooth LE and Windows' BLE stack adds delay.</p>
+  than USB, because the controller talks Bluetooth LE and Windows' BLE stack adds delay. The OS
+  version matters a lot: <strong>Windows 10 caps BLE polling around ~20 Hz</strong> (sluggish),
+  Windows 11 reaches ~70 Hz. USB always runs at 250 Hz.</p>
   <ol>
     <li><strong>Do not pair the controller in Windows Bluetooth settings.</strong> If it's already
         paired there, remove it first — Windows will otherwise grab the connection for itself.</li>
