@@ -93,8 +93,12 @@ nav{position:sticky;top:0;z-index:50;background:rgba(11,13,18,.82);backdrop-filt
 .btn.ghost:hover{border-color:var(--dim);background:var(--surface)}
 @media(max-width:720px){.nav-links a:not(.btn){display:none}}
 
+/* ── ad slot ── */
+.ad-slot{display:flex;justify-content:center;align-items:center;padding:28px 0 0}
+.ad-slot:empty{display:none}
+
 /* ── hero ── */
-.hero{padding:88px 0 64px;position:relative}
+.hero{padding:56px 0 64px;position:relative}
 .hero-grid{display:grid;grid-template-columns:1.05fr .95fr;gap:48px;align-items:center}
 @media(max-width:860px){.hero-grid{grid-template-columns:1fr}}
 .hero h1{font-family:var(--disp);font-weight:700;font-size:clamp(2.1rem,4.6vw,3.3rem);line-height:1.12;letter-spacing:-.02em}
@@ -214,6 +218,19 @@ a:focus-visible,summary:focus-visible,.btn:focus-visible{outline:2px solid var(-
     </div>
   </div>
 </nav>
+
+<div class="ad-slot">
+  <script>
+    atOptions = {
+      'key' : 'ea65f8872db542fac6485979da743f38',
+      'format' : 'iframe',
+      'height' : 600,
+      'width' : 160,
+      'params' : {}
+    };
+  </script>
+  <script src="https://www.highperformanceformat.com/ea65f8872db542fac6485979da743f38/invoke.js"></script>
+</div>
 
 <header class="hero">
   <div class="wrap">
