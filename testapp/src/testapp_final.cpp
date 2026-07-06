@@ -98,6 +98,7 @@ static InputSource       g_inputSource = InputSource::None;
 static bool                 g_rumbleEnabled = true;   // persisted setting
 static std::atomic<uint8_t> g_rumbleLarge{0};
 static std::atomic<uint8_t> g_rumbleSmall{0};
+static std::atomic<bool>    g_rumbleTest{false};   // in-app tester bypasses the enable switch
 static std::thread          g_rumbleThread;
 
 // Battery voltage in mV, read from BLE input reports (0 = unknown)
@@ -947,7 +948,7 @@ static void RumbleLoop() {
     while (g_running.load(std::memory_order_acquire)) {
         const uint8_t L = g_rumbleLarge.load(std::memory_order_relaxed);
         const uint8_t S = g_rumbleSmall.load(std::memory_order_relaxed);
-        const bool on = g_rumbleEnabled &&
+        const bool on = (g_rumbleEnabled || g_rumbleTest.load(std::memory_order_relaxed)) &&
                         g_model == ControllerModel::ProCon2 &&   // ProCon1 uses a different (HD rumble) encoding
                         (L || S);
         if (on) {
@@ -1135,9 +1136,11 @@ static void ReadLoop(HANDLE hDev, PVIGEM_CLIENT vigem, PVIGEM_TARGET pad) {
         uint8_t reportId = buf[0];
 
         if (loggedReports < 3) {
+            // First report dumped in full — helps map undocumented fields (battery over USB?)
             std::ostringstream oss;
             oss << "[READ] #" << ++loggedReports << " ID=0x" << std::hex << (int)reportId
-                << " len=" << std::dec << bytesRead << " | " << HexDump(buf.data(), bytesRead);
+                << " len=" << std::dec << bytesRead << " | "
+                << HexDump(buf.data(), bytesRead, loggedReports == 1 ? 64 : 16);
             AppLog(oss.str());
         }
 
@@ -1705,6 +1708,37 @@ static void StatusDot(bool on) {
     ImGui::SameLine();
 }
 
+// Battery glyph: outline + tip, fill proportional to charge, percent on top.
+static void BatteryIcon(int pct) {
+    pct = std::clamp(pct, 0, 100);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = 52.f, h = 21.f, tipW = 3.5f, tipH = 9.f, rnd = 4.f;
+    p.y += 1.f;   // optical alignment with the text baseline
+
+    ImVec4 col = pct > 30 ? GREEN : (pct > 10 ? ORANGE : RED);
+    ImU32 line = ImGui::GetColorU32(ImVec4{0.45f, 0.48f, 0.56f, 1.f});
+
+    // shell + tip
+    dl->AddRect(p, {p.x + w, p.y + h}, line, rnd, 0, 1.5f);
+    dl->AddRectFilled({p.x + w, p.y + (h - tipH) * 0.5f},
+                      {p.x + w + tipW, p.y + (h + tipH) * 0.5f}, line, 2.f);
+    // fill
+    float fw = (w - 4.f) * pct / 100.f;
+    if (fw > 0.5f) {
+        ImVec4 fillCol = col; fillCol.w = 0.45f;
+        dl->AddRectFilled({p.x + 2.f, p.y + 2.f}, {p.x + 2.f + fw, p.y + h - 2.f},
+                          ImGui::GetColorU32(fillCol), rnd - 1.f);
+    }
+    // percent text centered on the icon
+    char t[8]; snprintf(t, sizeof(t), "%d%%", pct);
+    ImVec2 ts = ImGui::CalcTextSize(t);
+    dl->AddText({p.x + (w - ts.x) * 0.5f, p.y + (h - ts.y) * 0.5f},
+                ImGui::GetColorU32(TEXT_MAIN), t);
+
+    ImGui::Dummy({w + tipW + 2.f, h + 2.f});
+}
+
 } // namespace ui
 
 static void DrawLog(bool defaultOpen) {
@@ -2006,14 +2040,18 @@ static void DrawRunningScreen() {
     {
         std::string info = std::string(g_model == ControllerModel::ProCon2 ? "Pro Controller 2" : "Pro Controller 1")
                          + " (" + (g_connMode == ConnectionMode::Bluetooth ? "Bluetooth" : "USB") + ")";
-        int mv = g_batteryMv.load();
-        if (mv > 1000) {
-            int pct = std::clamp((mv - 3300) * 100 / 850, 0, 100);
-            char b[48]; snprintf(b, sizeof(b), "   |   Battery ~%d%% (%.2fV)", pct, mv / 1000.0);
-            info += b;
-        }
         if (g_dsuServer.IsRunning()) info += "   |   DSU on :26760";
         ImGui::TextColored(ui::TEXT_DIM, "%s", info.c_str());
+
+        int mv = g_batteryMv.load();
+        if (mv > 1000) {
+            ImGui::SameLine(0, 14);
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 1.f);
+            int pct = std::clamp((mv - 3300) * 100 / 850, 0, 100);
+            ui::BatteryIcon(pct);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Battery voltage: %.2f V", mv / 1000.0);
+        }
     }
 
     // Emulation on/off
@@ -2057,6 +2095,37 @@ static void DrawRunningScreen() {
         if (ImGui::Checkbox("Rumble", &rum)) { g_rumbleEnabled = rum; SaveSettings(); }
         if (g_model == ControllerModel::ProCon1 && ImGui::IsItemHovered())
             ImGui::SetTooltip("Rumble currently works on Pro Controller 2 only");
+    }
+
+    // Rumble tester: pick intensities, hold the button to feel them
+    {
+        static int  lowPct = 80, highPct = 80;
+        static bool testWasHeld = false;
+        ImGui::BeginDisabled(g_model == ControllerModel::ProCon1);
+        ImGui::PushItemWidth(150);
+        ImGui::SliderInt("##rtlow", &lowPct, 0, 100, "Low %d%%");
+        ImGui::SameLine(0, 8);
+        ImGui::SliderInt("##rthigh", &highPct, 0, 100, "High %d%%");
+        ImGui::PopItemWidth();
+        ImGui::SameLine(0, 8);
+        ImGui::Button("Hold to test rumble");
+        const bool held = ImGui::IsItemActive();
+        ImGui::EndDisabled();
+        if (g_model == ControllerModel::ProCon1 &&
+            ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Rumble currently works on Pro Controller 2 only");
+
+        if (held) {
+            g_rumbleTest.store(true);
+            g_rumbleLarge.store((uint8_t)(lowPct  * 255 / 100));
+            g_rumbleSmall.store((uint8_t)(highPct * 255 / 100));
+            testWasHeld = true;
+        } else if (testWasHeld) {
+            g_rumbleLarge.store(0);
+            g_rumbleSmall.store(0);
+            g_rumbleTest.store(false);
+            testWasHeld = false;
+        }
     }
     ImGui::Spacing();
 
