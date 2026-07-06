@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>connectyourpro — Connect your Switch 2 Pro Controller to PC (free tool)</title>
+<title>connectyourpro — Connect your Switch 1/2 Pro Controller to PC</title>
 <meta name="description" content="Free, open-source Windows tool that makes the Nintendo Switch 2 Pro Controller (and the original Pro Controller) work on PC as an Xbox 360 or DualShock 4 pad. One click, no browser tricks.">
 <link rel="canonical" href="https://connectyour.pro/">
 <meta property="og:type" content="website">
@@ -13,7 +13,7 @@
 <meta property="og:url" content="https://connectyour.pro/">
 <meta property="og:image" content="https://connectyour.pro/shots/dashboard.jpg">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Connect your Switch 2 Pro Controller to PC — free tool">
+<meta name="twitter:title" content="Connect your Switch 1/2 Pro Controller to PC">
 <meta name="twitter:description" content="Built-in activation, XInput/DS4 output, live test view, remapping, gyro. Free & open source.">
 <meta name="twitter:image" content="https://connectyour.pro/shots/dashboard.jpg">
 <script type="application/ld+json">
@@ -166,8 +166,9 @@ h2{font-family:var(--disp);font-weight:600;font-size:clamp(1.5rem,3vw,2.1rem);le
 /* screenshots */
 .shots{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:36px}
 @media(max-width:720px){.shots{grid-template-columns:1fr}}
-.shot{aspect-ratio:16/10;border-radius:12px;overflow:hidden;border:1px solid var(--line);background:var(--surface)}
-.shot img{width:100%;height:100%;object-fit:cover;display:block}
+.shot{border-radius:12px;overflow:hidden;border:1px solid var(--line);background:var(--surface)}
+.shot img{width:100%;height:auto;display:block}
+.shot .ph{aspect-ratio:16/10}
 .shot .ph{width:100%;height:100%;display:flex;flex-direction:column;gap:8px;align-items:center;justify-content:center;color:#4a5266;font-family:var(--mono);font-size:.78rem;border:2px dashed var(--line);border-radius:12px}
 
 /* faq */
@@ -236,7 +237,7 @@ a:focus-visible,summary:focus-visible,.btn:focus-visible{outline:2px solid var(-
   <div class="wrap">
     <div class="hero-grid">
       <div>
-        <h1>Your Switch Pro Controller,<br>working on PC <span class="pro">in one click.</span></h1>
+        <h1>Your Pro Controller<br>working on PC<br><span class="pro">in one click</span></h1>
         <p class="lead">The Switch 2 Pro Controller does nothing when you plug it into a PC —
         it waits for a secret handshake only the console sends. connectyourpro sends it for you
         and turns the pad into an Xbox 360 or DualShock 4 controller every game understands.</p>
