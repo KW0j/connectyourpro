@@ -1135,6 +1135,12 @@ static void ReadLoop(HANDLE hDev, PVIGEM_CLIENT vigem, PVIGEM_TARGET pad) {
 
         uint8_t reportId = buf[0];
 
+        // ProCon2 USB battery: byte 16 of the 0x09 report tracks voltage in
+        // ~10mV steps above 3.0V (verified against BLE readings: 0x46→3.70V
+        // at 45%, 0x43→3.67V at 44%)
+        if (reportId == 0x09 && g_model == ControllerModel::ProCon2 && bytesRead >= 17)
+            g_batteryMv.store(3000 + buf[16] * 10, std::memory_order_relaxed);
+
         if (loggedReports < 3) {
             // First report dumped in full — helps map undocumented fields (battery over USB?)
             std::ostringstream oss;
@@ -2045,12 +2051,12 @@ static void DrawRunningScreen() {
 
         int mv = g_batteryMv.load();
         if (mv > 1000) {
-            ImGui::SameLine(0, 14);
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 1.f);
+            ImGui::SetCursorPosX(16);
             int pct = std::clamp((mv - 3300) * 100 / 850, 0, 100);
             ui::BatteryIcon(pct);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Battery voltage: %.2f V", mv / 1000.0);
+                ImGui::SetTooltip("Battery voltage: %.2f V%s", mv / 1000.0,
+                                  g_connMode == ConnectionMode::Usb ? " (charging over USB)" : "");
         }
     }
 
@@ -2097,30 +2103,34 @@ static void DrawRunningScreen() {
             ImGui::SetTooltip("Rumble currently works on Pro Controller 2 only");
     }
 
-    // Rumble tester: pick intensities, hold the button to feel them
+    // Rumble tester: pick intensities, hold the button to feel them.
+    // Shown only while the Rumble switch above is enabled.
     {
-        static int  lowPct = 80, highPct = 80;
         static bool testWasHeld = false;
-        ImGui::BeginDisabled(g_model == ControllerModel::ProCon1);
-        ImGui::PushItemWidth(150);
-        ImGui::SliderInt("##rtlow", &lowPct, 0, 100, "Low %d%%");
-        ImGui::SameLine(0, 8);
-        ImGui::SliderInt("##rthigh", &highPct, 0, 100, "High %d%%");
-        ImGui::PopItemWidth();
-        ImGui::SameLine(0, 8);
-        ImGui::Button("Hold to test rumble");
-        const bool held = ImGui::IsItemActive();
-        ImGui::EndDisabled();
-        if (g_model == ControllerModel::ProCon1 &&
-            ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("Rumble currently works on Pro Controller 2 only");
-
-        if (held) {
-            g_rumbleTest.store(true);
-            g_rumbleLarge.store((uint8_t)(lowPct  * 255 / 100));
-            g_rumbleSmall.store((uint8_t)(highPct * 255 / 100));
-            testWasHeld = true;
-        } else if (testWasHeld) {
+        bool held = false;
+        if (g_rumbleEnabled) {
+            static int lowPct = 80, highPct = 80;
+            ImGui::BeginDisabled(g_model == ControllerModel::ProCon1);
+            ImGui::PushItemWidth(150);
+            ImGui::SliderInt("##rtlow", &lowPct, 0, 100, "Low %d%%");
+            ImGui::SameLine(0, 8);
+            ImGui::SliderInt("##rthigh", &highPct, 0, 100, "High %d%%");
+            ImGui::PopItemWidth();
+            ImGui::SameLine(0, 8);
+            ImGui::Button("Hold to test rumble");
+            held = ImGui::IsItemActive();
+            ImGui::EndDisabled();
+            if (g_model == ControllerModel::ProCon1 &&
+                ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Rumble currently works on Pro Controller 2 only");
+            if (held) {
+                g_rumbleTest.store(true);
+                g_rumbleLarge.store((uint8_t)(lowPct  * 255 / 100));
+                g_rumbleSmall.store((uint8_t)(highPct * 255 / 100));
+                testWasHeld = true;
+            }
+        }
+        if (!held && testWasHeld) {   // also fires when the checkbox gets unticked mid-hold
             g_rumbleLarge.store(0);
             g_rumbleSmall.store(0);
             g_rumbleTest.store(false);
