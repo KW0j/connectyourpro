@@ -1135,11 +1135,14 @@ static void ReadLoop(HANDLE hDev, PVIGEM_CLIENT vigem, PVIGEM_TARGET pad) {
 
         uint8_t reportId = buf[0];
 
-        // ProCon2 USB battery: byte 16 of the 0x09 report tracks voltage in
-        // ~10mV steps above 3.0V (verified against BLE readings: 0x46→3.70V
-        // at 45%, 0x43→3.67V at 44%)
-        if (reportId == 0x09 && g_model == ControllerModel::ProCon2 && bytesRead >= 17)
-            g_batteryMv.store(3000 + buf[16] * 10, std::memory_order_relaxed);
+        // ProCon2 USB battery: the 0x09 report has no voltage field — byte 2 is
+        // a Power-Info byte, bits 2-5 = charge level 0-9 (bits 0-1 = charging
+        // flags). Layout documented by Switch2Connect. Synthesize a voltage so
+        // the shared mv→percent mapping lands on level/9 (0% .. 100%).
+        if (reportId == 0x09 && g_model == ControllerModel::ProCon2 && bytesRead >= 3) {
+            int level = std::min((buf[2] >> 2) & 0x0F, 9);
+            g_batteryMv.store(3300 + level * 850 / 9, std::memory_order_relaxed);
+        }
 
         if (loggedReports < 3) {
             // First report dumped in full — helps map undocumented fields (battery over USB?)
