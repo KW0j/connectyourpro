@@ -24,15 +24,13 @@ Xbox 360 (XInput) or DualShock 4 gamepad that every PC game understands.
 
 ## Features
 
-- **Switch 2 Pro Controller** over **USB** (recommended) and **Bluetooth** (experimental)
-- **Switch 1 Pro Controller** over USB and Bluetooth
-- Built-in activation - the [procon2tool](https://handheldlegend.github.io/procon2tool/)
-  "Enable HID Output" step happens automatically inside the app
+- **Switch 2 Pro Controller** over **USB** and **Bluetooth**
+- **Switch 1 Pro Controller** over **USB** and **Bluetooth**
+- Built-in activation based on [procon2tool](https://handheldlegend.github.io/procon2tool/)
 - Shows up in games as **Xbox 360 (XInput)** or **DualShock 4** - switchable in the app
-- **Live controller test view** - pressed buttons light up on a schematic, sticks move in real time
-- **Button remapping** - click a button on the schematic and pick what it outputs
+- **Live controller test view**
+- **Button remapping**
 - **DSU server** (Cemuhook protocol) - gyro/motion for Dolphin, Cemu and other emulators
-- Settings persist between sessions (`connectyourpro.ini`)
 
 ## Installation
 
@@ -65,19 +63,23 @@ The executable lands in `build\testapp.exe`. The installer script lives in
 ## FAQ
 
 **The "Pro Controller" entry in Windows game controllers shows random button clicks.**
+
 That's the *physical* controller - after activation it speaks a protocol Windows doesn't
 understand, so the built-in test panel shows garbage. Games use the virtual
 **Xbox 360 Controller** instead. Ignore the Pro Controller entry.
 
 **The controller stopped connecting at all.**
+
 These controllers have a built-in cooldown: too many connect attempts in a short time and
 they sulk for a few minutes. Wait a bit and try again.
 
 **No input after Connect (USB).**
+
 Unplug the cable, plug it back in, press Connect again. As a last resort the app has a
 fallback button that opens procon2tool in the browser.
 
 **Does it work with Steam?**
+
 Yes - Steam sees the virtual Xbox 360 / DS4 pad like any other controller.
 
 ## Credits
