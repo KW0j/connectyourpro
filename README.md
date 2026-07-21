@@ -17,7 +17,7 @@
 
 ---
 
-The Switch 2 Pro Controller does nothing when you plug it into a PC — it waits for a
+The Switch 2 Pro Controller does nothing when you plug it into a PC - it waits for a
 proprietary activation sequence that only the console normally sends. **connectyourpro
 performs that activation automatically** and turns the controller into a standard
 Xbox 360 (XInput) or DualShock 4 gamepad that every PC game understands.
