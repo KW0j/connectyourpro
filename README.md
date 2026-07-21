@@ -80,7 +80,7 @@ fallback button that opens procon2tool in the browser.
 
 **Does it work with Steam?**
 
-Yes - Steam sees the virtual Xbox 360 / DS4 pad like any other controller.
+Yes - Steam sees the virtual Xbox 360 / DS4 gamepad like any other controller.
 
 ## Credits
 
