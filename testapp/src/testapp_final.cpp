@@ -304,6 +304,10 @@ static std::string HexDump(const uint8_t* d, size_t n, size_t maxBytes = 16) {
 //   B) fall back to the generic USB device interface GUID.
 // Every candidate path is opened and validated: it must expose bulk IN + OUT.
 
+// VID/PID substring the discovery pass filters device paths by. Set by
+// OpenVendorInterface() so the same code serves both controller models.
+static std::string g_vendorPidFilter = "PID_2069";
+
 static bool ParseGUIDStr(const WCHAR* s, GUID& g) {
     unsigned a, b, c, d[8];
     if (swscanf_s(s, L"{%8X-%4X-%4X-%2X%2X-%2X%2X%2X%2X%2X%2X}",
@@ -421,7 +425,7 @@ static bool TryGuid(const GUID& ifGuid, const char* label) {
             std::string up = p;
             for (auto& c : up) c = (char)toupper((unsigned char)c);
             if (up.find("VID_057E") != std::string::npos &&
-                up.find("PID_2069") != std::string::npos) {
+                up.find(g_vendorPidFilter) != std::string::npos) {
                 AppLog(std::string("[USB] Candidate (") + label + "): " + p.substr(0, 90));
                 if (TryOpenVendorPath(det->DevicePath)) {
                     AppLog("[USB] Vendor bulk interface opened!");
@@ -435,8 +439,12 @@ static bool TryGuid(const GUID& ifGuid, const char* label) {
     return ok;
 }
 
-// Main discovery entry point.
-static bool OpenVendorInterface() {
+// Main discovery entry point. `pid` selects the controller model; on return
+// g_usb* hold the vendor bulk interface (ProCon2) and/or g_raw* hold a
+// WinUSB-bound HID interface (either model). Returns true only for the former.
+static bool OpenVendorInterface(USHORT pid) {
+    { std::ostringstream o; o << "PID_" << std::uppercase << std::hex << pid;
+      g_vendorPidFilter = o.str(); }
     // A) Registry DeviceInterfaceGUID(s) of every present 057E:2069 devnode.
     //    This is how both MS OS descriptor installs and Zadig register paths.
     HDEVINFO di = SetupDiGetClassDevs(nullptr, "USB", nullptr,
@@ -448,7 +456,7 @@ static bool OpenVendorInterface() {
             if (!SetupDiGetDeviceInstanceIdA(di, &dd, instId, sizeof(instId), nullptr)) continue;
             char upper[512]; strncpy_s(upper, instId, 511);
             for (char* p = upper; *p; p++) *p = (char)toupper((unsigned char)*p);
-            if (!strstr(upper, "VID_057E") || !strstr(upper, "PID_2069")) continue;
+            if (!strstr(upper, "VID_057E") || !strstr(upper, g_vendorPidFilter.c_str())) continue;
             AppLog("[USB] Devnode: " + std::string(instId));
 
             HKEY key = SetupDiOpenDevRegKey(di, &dd, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
@@ -593,6 +601,9 @@ static bool SendProcon2InitSequence() {
 
 static USHORT g_hidInputReportLen  = 64;
 static USHORT g_hidOutputReportLen = 64;
+// True when the HID handle was opened with no sharing, which keeps every other
+// process (games included) from reading the physical controller.
+static bool   g_hidExclusive       = false;
 
 static HANDLE FindHidDevice(USHORT pid) {
     GUID hidGuid;
@@ -605,7 +616,8 @@ static HANDLE FindHidDevice(USHORT pid) {
         return INVALID_HANDLE_VALUE;
     }
 
-    HANDLE found = INVALID_HANDLE_VALUE;
+    HANDLE      found = INVALID_HANDLE_VALUE;
+    std::string foundPath;
     SP_DEVICE_INTERFACE_DATA ifData = {}; ifData.cbSize = sizeof(ifData);
 
     for (DWORD i = 0; SetupDiEnumDeviceInterfaces(devInfo, nullptr, &hidGuid, i, &ifData); i++) {
@@ -637,7 +649,8 @@ static HANDLE FindHidDevice(USHORT pid) {
                         }
                         HidD_FreePreparsedData(pp);
                     }
-                    found = h;
+                    found     = h;
+                    foundPath = detail->DevicePath;
                     free(detail);
                     break;
                 }
@@ -648,6 +661,30 @@ static HANDLE FindHidDevice(USHORT pid) {
     }
 
     SetupDiDestroyDeviceInfoList(devInfo);
+    if (found == INVALID_HANDLE_VALUE) return found;
+
+    // Reopen with no sharing. While we hold the device exclusively Windows lets
+    // no other process read it, so games see only the virtual pad instead of
+    // flip-flopping between it and the physical controller. Not always
+    // grantable — when the OS gamepad stack already holds a handle we keep
+    // shared access and both devices stay visible to games.
+    CloseHandle(found);
+    found = CreateFile(foundPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                       0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+    if (found != INVALID_HANDLE_VALUE) {
+        g_hidExclusive = true;
+        AppLog("[HID] Opened exclusively — physical controller hidden from other apps.");
+        return found;
+    }
+
+    AppLog("[HID] Exclusive open refused (err=" + std::to_string(GetLastError()) +
+           ") — falling back to shared access. Games will also see the physical controller.");
+    g_hidExclusive = false;
+    found = CreateFile(foundPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+    if (found == INVALID_HANDLE_VALUE)
+        AppLog("[HID] Shared reopen failed err=" + std::to_string(GetLastError()));
     return found;
 }
 
@@ -664,12 +701,48 @@ static bool WaitForHidInput(HANDLE hDev, int timeoutMs) {
     return got;
 }
 
+// Same probe as WaitForHidInput, but on the WinUSB interrupt IN pipe.
+static bool WaitForRawInput(int timeoutMs) {
+    if (!g_rawDev || !g_rawPipeIn) return false;
+    uint8_t buf[64] = {0};
+    OVERLAPPED ov = {}; ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    BOOL ok = WinUsb_ReadPipe(g_rawDev, g_rawPipeIn, buf, sizeof(buf), nullptr, &ov);
+    if (!ok && GetLastError() != ERROR_IO_PENDING) { CloseHandle(ov.hEvent); return false; }
+    bool got = (WaitForSingleObject(ov.hEvent, timeoutMs) == WAIT_OBJECT_0);
+    WinUsb_AbortPipe(g_rawDev, g_rawPipeIn);
+    CloseHandle(ov.hEvent);
+    return got;
+}
+
 // ─── ProCon1 (Switch 1) USB handshake — beta ─────────────────────────────────
 //
 // Classic, well-documented Nintendo protocol: USB commands via report 0x80,
 // then subcommands via report 0x01 to enable full 0x30 reports + IMU.
 
 static bool ProCon1WriteReport(HANDLE hDev, const uint8_t* data, size_t len) {
+    // WinUSB path: the HID class driver isn't bound, so there is no file handle
+    // to WriteFile to — reports go out over the interrupt OUT pipe, or a control
+    // SET_REPORT when the interface exposes no OUT endpoint.
+    if (g_rawDev) {
+        uint8_t rep[64] = {0};
+        memcpy(rep, data, std::min(len, sizeof(rep)));
+        ULONG w = 0;
+        BOOL ok;
+        if (g_rawPipeOut) {
+            ok = WinUsb_WritePipe(g_rawDev, g_rawPipeOut, rep, sizeof(rep), &w, nullptr);
+        } else {
+            WINUSB_SETUP_PACKET sp = {};
+            sp.RequestType = 0x21;                            // host→device, class, interface
+            sp.Request     = 0x09;                            // SET_REPORT
+            sp.Value       = (USHORT)(0x0200 | rep[0]);       // output report, id from the payload
+            sp.Index       = 0;
+            sp.Length      = sizeof(rep);
+            ok = WinUsb_ControlTransfer(g_rawDev, sp, rep, sizeof(rep), &w, nullptr);
+        }
+        if (!ok) AppLog("[PC1] WinUSB write failed err=" + std::to_string(GetLastError()));
+        return ok != FALSE;
+    }
+
     std::vector<uint8_t> buf(std::max((USHORT)64, g_hidOutputReportLen), 0);
     memcpy(buf.data(), data, std::min(len, buf.size()));
     OVERLAPPED ov = {}; ov.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
@@ -1399,7 +1472,7 @@ static void DoConnect() {
 
         if (pc2) {
             // ── Built-in procon2tool step 1: open vendor interface + init ───
-            if (OpenVendorInterface()) {
+            if (OpenVendorInterface(PROCON2_PID)) {
                 usbInitDone = SendProcon2InitSequence();
             } else {
                 AppLog("[CONNECT] Vendor bulk interface not found — controller may already be "
@@ -1436,21 +1509,52 @@ static void DoConnect() {
                 g_inputSource = InputSource::Bulk;
             }
         } else {
-            // ── ProCon1 (Switch 1) — classic HID handshake ───────────────────
-            // Over Bluetooth the controller shows up as a standard HID device
-            // once paired in Windows settings; the 0x80 USB commands are skipped.
-            hDev = FindHidDevice(PROCON1_PID);
-            if (hDev == INVALID_HANDLE_VALUE) {
-                g_connectError = bt
-                    ? "Switch 1 Pro Controller not found. Pair it first in Windows Bluetooth settings "
-                      "(hold the SYNC button), then press Connect."
-                    : "Switch 1 Pro Controller not found. Connect it with a USB cable.";
-                g_screen = AppScreen::Setup; return;
+            // ── ProCon1 (Switch 1) ───────────────────────────────────────────
+            // Over USB, prefer the WinUSB path: when winusb.sys owns the device
+            // Windows' HID stack never enumerates it as a gamepad, so games see
+            // only the ViGEm pad instead of flip-flopping between the two.
+            // Falls back to the HID class driver (shared — games see both) when
+            // WinUSB isn't bound. Bluetooth is BT-HID only, so no WinUSB there.
+            if (!bt) {
+                OpenVendorInterface(PROCON1_PID);
+                if (g_rawDev) {
+                    AppLog("[CONNECT] ProCon1 is bound to WinUSB — using the interrupt pipe "
+                           "(physical pad stays hidden from games).");
+                    ULONG timeout = 0;   // infinite — the read loop handles cancellation
+                    WinUsb_SetPipePolicy(g_rawDev, g_rawPipeIn, PIPE_TRANSFER_TIMEOUT,
+                                         sizeof(timeout), &timeout);
+                    ProCon1Handshake(INVALID_HANDLE_VALUE, true);  // routes over g_rawDev
+                    if (WaitForRawInput(3000)) {
+                        g_inputSource = InputSource::RawHid;
+                        AppLog("[CONNECT] ProCon1 input is streaming (WinUSB)!");
+                    } else {
+                        AppLog("[CONNECT] No input on the WinUSB pipe — falling back to HID class.");
+                        CloseVendorInterface();
+                    }
+                } else {
+                    AppLog("[CONNECT] WinUSB not bound to the ProCon1 — using the HID class driver. "
+                           "Games will also see the physical pad; bind WinUSB with Zadig to stop that.");
+                }
             }
-            ProCon1Handshake(hDev, !bt);
-            if (WaitForHidInput(hDev, 3000)) {
-                g_inputSource = InputSource::Hid;
-                AppLog("[CONNECT] ProCon1 input is streaming!");
+
+            // ── HID class fallback (always the path over Bluetooth) ──────────
+            // The controller shows up as a standard HID device once paired in
+            // Windows settings; the 0x80 USB commands are skipped over BT.
+            if (g_inputSource == InputSource::None) {
+                hDev = FindHidDevice(PROCON1_PID);
+                if (hDev == INVALID_HANDLE_VALUE) {
+                    g_connectError = bt
+                        ? "Switch 1 Pro Controller not found. Pair it first in Windows Bluetooth settings "
+                          "(hold the SYNC button), then press Connect."
+                        : "Switch 1 Pro Controller not found. Connect it with a USB cable. "
+                          "(If you just bound WinUSB with Zadig, unplug and replug the cable, then retry.)";
+                    g_screen = AppScreen::Setup; return;
+                }
+                ProCon1Handshake(hDev, !bt);
+                if (WaitForHidInput(hDev, 3000)) {
+                    g_inputSource = InputSource::Hid;
+                    AppLog("[CONNECT] ProCon1 input is streaming!");
+                }
             }
         }
 
@@ -1486,6 +1590,10 @@ static void DoConnect() {
                 g_statusMsg = usbInitDone || !pc2
                     ? "Connected — controller activated automatically."
                     : "Connected — controller was already active.";
+                g_statusMsg += g_hidExclusive
+                    ? "  Physical pad is hidden from other apps."
+                    : "  Heads-up: Windows still shows the physical pad to games, so button "
+                      "prompts may flicker. See the log for how to fix it.";
                 break;
             case InputSource::RawHid:
                 g_statusMsg = "Connected — activated automatically (WinUSB input path).";
@@ -1534,7 +1642,8 @@ static void DoDisconnect() {
         }
     }
     g_dsuServer.Stop();
-    g_inputSource = InputSource::None;
+    g_inputSource  = InputSource::None;
+    g_hidExclusive = false;
     g_batteryMv.store(0);
     ClearLive();
     SaveSettings();
@@ -1938,6 +2047,30 @@ static void DrawSetupScreen() {
             ImGui::TextColored(ui::ORANGE,
                 "Windows 10 detected: the OS caps Bluetooth LE polling at ~20 Hz, so wireless "
                 "will feel sluggish here. Windows 11 (~70 Hz) or USB is strongly recommended.");
+        ImGui::PopTextWrapPos();
+    }
+
+    // Pro Controller 1 is a plain HID gamepad, so Windows enumerates it for
+    // games alongside the virtual pad — titles that pick the "last active"
+    // device then flip between gamepad and keyboard prompts. Binding WinUSB
+    // takes it out of the HID stack; over Bluetooth only HidHide can.
+    if (g_model == ControllerModel::ProCon1) {
+        ImGui::PushTextWrapPos(ui::g_colW);
+        if (g_connMode == ConnectionMode::Bluetooth) {
+            ImGui::TextColored(ui::ORANGE,
+                "Over Bluetooth, Windows also shows the physical controller to games, so button "
+                "prompts can flicker and inputs get dropped. Use USB with the WinUSB driver, or "
+                "install HidHide to hide the physical pad.");
+        } else {
+            ImGui::TextColored(ui::TEXT_DIM,
+                "On connect the controller is claimed exclusively, which hides it from games so "
+                "only the virtual pad remains. If Windows refuses (the log will say so), bind "
+                "WinUSB with Zadig instead — same result, one-time setup.");
+            if (ImGui::SmallButton("Open Zadig")) {
+                ShellExecuteA(nullptr, "open", "https://zadig.akeo.ie/",
+                              nullptr, nullptr, SW_SHOWNORMAL);
+            }
+        }
         ImGui::PopTextWrapPos();
     }
 

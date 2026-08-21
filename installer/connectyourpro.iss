@@ -1,11 +1,11 @@
-; connectyourpro — Inno Setup installer script
+﻿; connectyourpro — Inno Setup installer script
 ; Bundles the app + ViGEmBus driver (installed only when missing).
 ; Build:  ISCC.exe connectyourpro.iss   (run from this directory)
 ; Expects ..\build\testapp.exe to exist (build via ..\build_release.bat)
 ; and redist\ViGEmBus_Setup.exe (ViGEmBus 1.22.0 from nefarius/ViGEmBus releases).
 
 #define MyAppName "connectyourpro"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "connectyourpro"
 #define MyAppURL "https://connectyour.pro"
 #define MyAppExeName "connectyourpro.exe"
